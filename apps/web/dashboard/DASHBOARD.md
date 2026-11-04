@@ -53,3 +53,12 @@ DATABASE_URL is set to local postgresql, move to AWS link afterwards.
 3. Join a team via a code assigned to a team or a link
 4. If athlete, can see recent sessions, clicking on a session brings up those statistics, but as an individual view (only them)
 5. If coach, can see recent sessions, clicking on a session brings up those statistics but as a boat view. 
+
+
+testathlete
+Password123
+Athlete
+
+testcoach
+Password123
+Coach

@@ -81,8 +81,8 @@ export async function userFromRequest(req: Request) {
   if (!token) {
     return undefined;
   }
-  const result = await pool.query<{ id: string; email: string }>(
-    `SELECT users.id, users.email
+  const result = await pool.query<{ id: string; email: string; role: "athlete" | "coach" | null }>(
+    `SELECT users.id, users.email, users.role
      FROM sessions
      JOIN users ON users.id = sessions.user_id
      WHERE sessions.token_hash = $1 AND sessions.expires_at > now()`,

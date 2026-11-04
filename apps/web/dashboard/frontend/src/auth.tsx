@@ -1,12 +1,32 @@
 import { createContext, useContext, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { AuthFrame } from "./legal";
 
 type Mode = "login" | "signup";
 type Step = "form" | "verify";
 type Delivery = "email" | "log";
+export type Role = "athlete" | "coach";
 
-type AuthValue = {
+type Team = {
+  id: string;
+  code: string;
+  name: string | null;
+  location: string | null;
+  memberCount: number;
+};
+
+export type Account = {
+  userId: string;
   email: string;
+  username: string | null;
+  role: Role | null;
+  team: Team | null;
+};
+
+type AuthValue = Account & {
   logout: () => Promise<void>;
+  joinTeam: (code: string) => Promise<void>;
+  createTeam: (details: { name: string; location: string }) => Promise<void>;
+  applyAccount: (account: Account) => void;
 };
 
 type AuthResponse = {
@@ -64,9 +84,22 @@ function passwordStrength(password: string): "Weak" | "Fair" | "Strong" {
   return "Weak";
 }
 
+const emptyAccount: Account = { userId: "", email: "", username: null, role: null, team: null };
+
 export function AuthGate({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<"loading" | "anon" | "in">("loading");
-  const [email, setEmail] = useState("");
+  const [account, setAccount] = useState<Account>(emptyAccount);
+
+  async function loadAccount() {
+    const response = await fetch("/api/auth/me");
+    if (!response.ok) {
+      setAccount(emptyAccount);
+      setStatus("anon");
+      return;
+    }
+    setAccount((await response.json()) as Account);
+    setStatus("in");
+  }
 
   useEffect(() => {
     let active = true;
@@ -75,14 +108,14 @@ export function AuthGate({ children }: { children: ReactNode }) {
         if (!response.ok) {
           return null;
         }
-        return (await response.json()) as { email: string };
+        return (await response.json()) as Account;
       })
       .then((body) => {
         if (!active) {
           return;
         }
         if (body?.email) {
-          setEmail(body.email);
+          setAccount(body);
           setStatus("in");
         } else {
           setStatus("anon");
@@ -100,33 +133,116 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   async function logout() {
     await fetch("/api/auth/logout", { method: "POST" });
-    setEmail("");
+    setAccount(emptyAccount);
     setStatus("anon");
+  }
+
+  async function chooseRole(role: Role) {
+    const response = await fetch("/api/auth/role", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role }),
+    });
+    const body = (await response.json()) as Account & { error?: string };
+    if (!response.ok) {
+      throw new Error(body.error ?? "Could not save that role.");
+    }
+    setAccount(body);
+  }
+
+  async function joinTeam(code: string) {
+    const response = await fetch("/api/teams/join", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    const body = (await response.json()) as Account & { error?: string };
+    if (!response.ok) {
+      throw new Error(body.error ?? "Could not join that team.");
+    }
+    setAccount(body);
+  }
+
+  async function createTeam(details: { name: string; location: string }) {
+    const response = await fetch("/api/teams", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(details),
+    });
+    const body = (await response.json()) as Account & { error?: string };
+    if (!response.ok) {
+      throw new Error(body.error ?? "Could not create that team.");
+    }
+    setAccount(body);
   }
 
   if (status === "loading") {
     return (
-      <div className="auth-screen">
+      <AuthFrame>
         <img className="auth-logo" src="/impulse-logo.png?v=2" alt="Impulse" />
-      </div>
+      </AuthFrame>
     );
   }
 
   if (status === "anon") {
-    return (
-      <LoginPage
-        onSuccess={(nextEmail) => {
-          setEmail(nextEmail);
-          setStatus("in");
-        }}
-      />
-    );
+    return <LoginPage onSuccess={() => void loadAccount()} />;
   }
 
-  return <AuthContext.Provider value={{ email, logout }}>{children}</AuthContext.Provider>;
+  if (!account.role) {
+    return <RolePage onChoose={chooseRole} />;
+  }
+
+  return (
+    <AuthContext.Provider value={{ ...account, logout, joinTeam, createTeam, applyAccount: setAccount }}>
+      {children}
+    </AuthContext.Provider>
+  );
 }
 
-function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
+function RolePage({ onChoose }: { onChoose: (role: Role) => Promise<void> }) {
+  const [pending, setPending] = useState<Role | null>(null);
+  const [error, setError] = useState("");
+
+  async function choose(role: Role) {
+    setError("");
+    setPending(role);
+    try {
+      await onChoose(role);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not save that role.");
+      setPending(null);
+    }
+  }
+
+  return (
+    <AuthFrame>
+      <div className="role-panel">
+        <img className="auth-logo" src="/impulse-logo.png?v=2" alt="Impulse" />
+        <h1>How will you use Impulse?</h1>
+        <p className="auth-lead">Choose a role for this account. You can join a team after this.</p>
+        {error && (
+          <p className="auth-error" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="role-grid">
+          <button className="role-card" type="button" disabled={pending !== null} onClick={() => void choose("athlete")}>
+            <img className="role-icon" src="/oar-icon.png" alt="" />
+            <strong>Athlete</strong>
+            <span className="role-action">{pending === "athlete" ? "Saving" : "Continue as athlete"}</span>
+          </button>
+          <button className="role-card" type="button" disabled={pending !== null} onClick={() => void choose("coach")}>
+            <img className="role-icon" src="/megaphone-icon.png" alt="" />
+            <strong>Coach</strong>
+            <span className="role-action">{pending === "coach" ? "Saving" : "Continue as coach"}</span>
+          </button>
+        </div>
+      </div>
+    </AuthFrame>
+  );
+}
+
+function LoginPage({ onSuccess }: { onSuccess: () => void }) {
   const [step, setStep] = useState<Step>("form");
   const [mode, setMode] = useState<Mode>("login");
   const [email, setEmail] = useState("");
@@ -185,7 +301,7 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
         setError(body.error ?? "Could not sign in.");
         return;
       }
-      onSuccess(body.email);
+      onSuccess();
     } catch {
       setError("The server is unavailable. Check that the API and PostgreSQL are running.");
     } finally {
@@ -208,7 +324,7 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
         setError(body.error ?? "That code is incorrect.");
         return;
       }
-      onSuccess(body.email);
+      onSuccess();
     } catch {
       setError("The server is unavailable. Check that the API and PostgreSQL are running.");
     } finally {
@@ -241,7 +357,7 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
   }
 
   return (
-    <div className="auth-screen">
+    <AuthFrame>
       <div className="auth-stack">
         {error && (
           <p className="auth-error" role="alert">
@@ -294,7 +410,7 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
             <h1>{mode === "login" ? "Log in" : "Create an account"}</h1>
             <p className="auth-lead">
               {mode === "login"
-                ? "Use your email and password to open the dashboard."
+                ? "Use your email or username and password to open the dashboard."
                 : "Sign up with an email and a password. We'll email you a confirmation code."}
             </p>
             <div className="auth-switch" role="tablist" aria-label="Account">
@@ -306,11 +422,11 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
               </button>
             </div>
             <label className="auth-field">
-              <span>Email</span>
+              <span>{mode === "login" ? "Email or username" : "Email"}</span>
               <input
-                type="email"
+                type={mode === "login" ? "text" : "email"}
                 name="email"
-                autoComplete="email"
+                autoComplete={mode === "login" ? "username" : "email"}
                 value={email}
                 onChange={(event) => setEmail(event.target.value)}
                 required
@@ -343,7 +459,7 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
                   onClick={() => setShowPassword((current) => !current)}
                 >
                   <img
-                    src={showPassword ? "/password-hide.png" : "/password-show.png"}
+                    src={showPassword ? "/password-hide.png?v=3" : "/password-show.png?v=3"}
                     alt=""
                   />
                 </button>
@@ -382,7 +498,7 @@ function LoginPage({ onSuccess }: { onSuccess: (email: string) => void }) {
           </form>
         )}
       </div>
-    </div>
+    </AuthFrame>
   );
 }
 

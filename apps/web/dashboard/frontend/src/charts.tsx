@@ -1,4 +1,4 @@
-import { useMemo, type ComponentType } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import Highcharts from "highcharts";
 import "highcharts/highcharts-more";
 import HighchartsReactModule from "highcharts-react-official";
@@ -7,6 +7,7 @@ import { formatNumber, type Athlete } from "./data";
 const HighchartsReact: ComponentType<{
   highcharts: typeof Highcharts;
   options: Highcharts.Options;
+  callback?: (chart: Highcharts.Chart) => void;
 }> =
   typeof HighchartsReactModule === "function"
     ? HighchartsReactModule
@@ -15,6 +16,7 @@ const HighchartsReact: ComponentType<{
           HighchartsReact: ComponentType<{
             highcharts: typeof Highcharts;
             options: Highcharts.Options;
+            callback?: (chart: Highcharts.Chart) => void;
           }>;
         }
       ).HighchartsReact;
@@ -105,49 +107,120 @@ function tooltip(): Highcharts.TooltipOptions {
   };
 }
 
-export function ForceCurveChart({ peak }: { peak: number }) {
-  const options = useMemo<Highcharts.Options>(() => {
-    const curve = forceShape(peak);
-    const crew = forceShape(Math.round(peak * 0.9), 0.02);
-    let peakIndex = 0;
-    curve.forEach((point, index) => {
-      if (point[1] > curve[peakIndex][1]) {
-        peakIndex = index;
+export type SensorSample = [number, number, number, number];
+
+const CATCH_ANGLE = -56;
+const FINISH_ANGLE = 42;
+
+function strokePosition(angle: number) {
+  return Math.min(100, Math.max(0, ((angle - CATCH_ANGLE) / (FINISH_ANGLE - CATCH_ANGLE)) * 100));
+}
+
+function binDrive(samples: SensorSample[], channel: "force" | "footboard"): Array<[number, number]> {
+  const bins = Array.from({ length: 21 }, () => ({ sum: 0, count: 0 }));
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const sample = samples[index];
+    if (sample[0] - previous[0] > 0.4) {
+      continue;
+    }
+    if (sample[2] - previous[2] <= 0.4) {
+      continue;
+    }
+    const bin = Math.min(20, Math.round(strokePosition(sample[2]) / 5));
+    bins[bin].sum += channel === "footboard" ? sample[3] : sample[1];
+    bins[bin].count += 1;
+  }
+  const points = bins.flatMap((bin, index) => (bin.count === 0 ? [] : [[index * 5, Math.round(bin.sum / bin.count)] as [number, number]]));
+  return points.length === 0 ? [[0, 0], [100, 0]] : points;
+}
+
+function drivesIn(samples: SensorSample[]) {
+  const drives: SensorSample[][] = [];
+  let current: SensorSample[] = [];
+  const close = () => {
+    if (current.length > 1) {
+      drives.push(current);
+    }
+    current = [];
+  };
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const sample = samples[index];
+    if (sample[0] - previous[0] > 0.4) {
+      close();
+      continue;
+    }
+    if (sample[2] - previous[2] > 0.4) {
+      if (current.length === 0) {
+        current.push(previous);
       }
-    });
-    const peakPoint = curve[peakIndex];
-    const current = curve.map((point, index) =>
-      index === peakIndex
-        ? {
-            x: point[0],
-            y: point[1],
-            dataLabels: {
-              enabled: true,
-              useHTML: true,
-              crop: false,
-              overflow: "allow" as const,
-              y: -4,
-              format: `<span class="peak-callout">Peak Force<b>${formatNumber(point[1])} N</b></span>`,
-            },
-          }
-        : { x: point[0], y: point[1] },
-    );
+      current.push(sample);
+    } else {
+      close();
+    }
+  }
+  close();
+  return drives;
+}
+
+function drivePeak(drive: SensorSample[], channel: "force" | "footboard") {
+  return drive.reduce((peak, sample) => Math.max(peak, channel === "footboard" ? sample[3] : sample[1]), 0);
+}
+
+export function selectionCurve(samples: SensorSample[], start: number, end: number, channel: "force" | "footboard") {
+  if (start !== end) {
+    return binDrive(samples.filter((sample) => sample[0] >= start && sample[0] < end + 1), channel);
+  }
+  const nearby = samples.filter((sample) => sample[0] >= start - 1.5 && sample[0] <= start + 1.5);
+  const drives = drivesIn(nearby);
+  const overlapping = drives.filter((drive) => drive[drive.length - 1][0] >= start && drive[0][0] < start + 1);
+  const chosen = overlapping.reduce<SensorSample[] | undefined>((best, drive) => {
+    if (!best || drivePeak(drive, channel) > drivePeak(best, channel)) {
+      return drive;
+    }
+    return best;
+  }, undefined);
+  return binDrive(chosen ?? [], channel);
+}
+
+export function sessionCurve(samples: SensorSample[], channel: "force" | "footboard") {
+  return binDrive(samples, channel);
+}
+
+export function seriesPeak(points: Array<[number, number]>) {
+  return points.reduce((peak, point) => Math.max(peak, point[1]), 0);
+}
+
+export function ForceCurveChart({
+  current,
+  average,
+  yMax = 2000,
+  height = 228,
+}: {
+  current: Array<[number, number]>;
+  average: Array<[number, number]>;
+  yMax?: number;
+  height?: number;
+}) {
+  const options = useMemo<Highcharts.Options>(() => {
+    const peakAt = current.reduce((best, point) => (point[1] > best[1] ? point : best), current[0] ?? [0, 0]);
 
     return {
-      chart: baseChart(228, 28),
+      chart: baseChart(height, 28),
       title: { text: undefined },
       credits: { enabled: false },
       legend: { enabled: false },
       tooltip: tooltip(),
-      ...axes("Force (N)", 2000, "Stroke Position (%)"),
+      ...axes("Force (N)", yMax, "Stroke Position (%)"),
       xAxis: {
-        ...axes("Force (N)", 2000, "Stroke Position (%)").xAxis,
+        ...axes("Force (N)", yMax, "Stroke Position (%)").xAxis,
         min: 0,
         max: 100,
         tickInterval: 20,
         plotLines: [
           {
-            value: peakPoint[0],
+            value: peakAt[0],
             color: "#c5d0de",
             dashStyle: "Dash",
             width: 1,
@@ -156,25 +229,15 @@ export function ForceCurveChart({ peak }: { peak: number }) {
         ],
       },
       yAxis: {
-        ...axes("Force (N)", 2000, "Stroke Position (%)").yAxis,
-        tickInterval: 500,
+        ...axes("Force (N)", yMax, "Stroke Position (%)").yAxis,
+        tickInterval: yMax > 800 ? 500 : 200,
       },
       plotOptions: sharedPlot,
       series: [
         {
-          type: "arearange",
-          name: "Target Range",
-          data: crew.map(([x, y]) => [x, Math.round(y * 0.78), Math.round(y * 1.16)]),
-          color: "rgba(47, 107, 255, 0.14)",
-          lineWidth: 0,
-          marker: { enabled: false },
-          enableMouseTracking: false,
-          zIndex: 0,
-        } as Highcharts.SeriesArearangeOptions,
-        {
           type: "line",
-          name: "Crew Average",
-          data: crew,
+          name: "Session average",
+          data: average,
           color: "#98a6b8",
           dashStyle: "Dash",
           lineWidth: 1.5,
@@ -182,7 +245,7 @@ export function ForceCurveChart({ peak }: { peak: number }) {
         },
         {
           type: "areaspline",
-          name: "Current Stroke",
+          name: "Selected",
           data: current,
           color: blue,
           lineWidth: 2.4,
@@ -197,29 +260,195 @@ export function ForceCurveChart({ peak }: { peak: number }) {
         },
       ],
     };
-  }, [peak]);
+  }, [average, current, height, yMax]);
 
   return <HighchartsReact highcharts={Highcharts} options={options} />;
 }
 
-export function OarlockChart({ mode, peak }: { mode: "oarlock" | "footboard" | "percent"; peak: number }) {
-  const options = useMemo<Highcharts.Options>(() => {
-    const scale = mode === "percent" ? 38 : mode === "footboard" ? Math.round(peak * 0.42) : Math.round(peak * 0.9);
-    const yMax = mode === "percent" ? 100 : mode === "footboard" ? 1000 : 2000;
-    const currentName = mode === "percent" ? "Footboard %" : mode === "footboard" ? "Footboard (current)" : "Oarlock (current)";
-    const averageName = mode === "percent" ? "Crew average" : mode === "footboard" ? "Footboard (avg)" : "Oarlock (avg)";
-    const suffix = mode === "percent" ? "%" : " N";
+function nearestIndex(points: Array<[number, number]>, x: number) {
+  if (points.length === 0) {
+    return 0;
+  }
+  let low = 0;
+  let high = points.length - 1;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (points[mid][0] < x) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const previous = Math.max(0, low - 1);
+  return Math.abs(points[previous][0] - x) <= Math.abs(points[low][0] - x) ? previous : low;
+}
 
+export function PowerChart({
+  points,
+  start,
+  end,
+  height,
+  onPick,
+}: {
+  points: Array<[number, number]>;
+  start: number;
+  end: number;
+  height: number;
+  onPick: (start: number, end: number) => void;
+}) {
+  const pickRef = useRef(onPick);
+  pickRef.current = onPick;
+  const pointsRef = useRef(points);
+  pointsRef.current = points;
+  const [chart, setChart] = useState<Highcharts.Chart | null>(null);
+  const options = useMemo<Highcharts.Options>(() => {
+    let dragged = false;
     return {
-      chart: baseChart(188, 8),
+      chart: {
+        ...baseChart(height, 8),
+        zooming: { type: "x" },
+        selectionMarkerFill: "rgba(21, 32, 51, 0.12)",
+        events: {
+          click(event) {
+            if (dragged) {
+              dragged = false;
+              return;
+            }
+            const live = pointsRef.current;
+            const axisChart = this as Highcharts.Chart;
+            const value = axisChart.xAxis[0].toValue((event.chartX ?? 0) - axisChart.plotLeft, true);
+            const index = nearestIndex(live, value);
+            pickRef.current(index, index);
+          },
+          selection(event) {
+            dragged = true;
+            const live = pointsRef.current;
+            const axis = event.xAxis?.[0];
+            if (!axis) {
+              pickRef.current(0, Math.max(0, live.length - 1));
+              return false;
+            }
+            const first = nearestIndex(live, axis.min);
+            const last = nearestIndex(live, axis.max);
+            pickRef.current(Math.min(first, last), Math.max(first, last));
+            return false;
+          },
+        },
+      },
       title: { text: undefined },
       credits: { enabled: false },
       legend: { enabled: false },
       tooltip: {
         ...tooltip(),
-        valueSuffix: suffix,
+        animation: false,
+        formatter() {
+          const total = Math.max(0, Math.round(this.x ?? 0));
+          const minutes = Math.floor(total / 60);
+          const seconds = total % 60;
+          const watts = Math.round(this.y ?? 0);
+          return `${minutes}:${String(seconds).padStart(2, "0")}<br/><b>${formatNumber(watts)} W</b>`;
+        },
       },
-      ...axes(mode === "percent" ? "Footboard %" : "Force (N)", yMax, "Stroke Position (%)"),
+      xAxis: {
+        title: { text: "Time", style: labelStyle },
+        min: points[0]?.[0] ?? 0,
+        max: points[points.length - 1]?.[0] ?? 1,
+        tickInterval: (points[points.length - 1]?.[0] ?? 0) - (points[0]?.[0] ?? 0) > 600 ? 300 : 60,
+        lineColor: line,
+        tickColor: line,
+        labels: {
+          style: labelStyle,
+          formatter() {
+            const total = Math.max(0, Math.round(Number(this.value)));
+            const minutes = Math.floor(total / 60);
+            const seconds = total % 60;
+            return `${minutes}:${String(seconds).padStart(2, "0")}`;
+          },
+        },
+      },
+      yAxis: {
+        title: { text: "Watts", style: labelStyle },
+        min: 0,
+        gridLineColor: line,
+        labels: { style: labelStyle },
+      },
+      plotOptions: {
+        series: {
+          animation: false,
+          cursor: "pointer",
+          turboThreshold: 1,
+          findNearestPointBy: "x",
+          states: { hover: { enabled: false }, inactive: { opacity: 1 } },
+          marker: { enabled: false, states: { hover: { enabled: false } } },
+        },
+      },
+      series: [
+        {
+          type: "line",
+          name: "Data",
+          data: points,
+          color: blue,
+          lineWidth: 1.2,
+        },
+      ],
+    };
+  }, [height, points]);
+
+  useEffect(() => {
+    const axis = chart?.xAxis?.[0] as (Highcharts.Axis & {
+      removePlotLine: (id: string) => void;
+      removePlotBand: (id: string) => void;
+      addPlotLine: (options: Highcharts.XAxisPlotLinesOptions) => void;
+      addPlotBand: (options: Highcharts.XAxisPlotBandsOptions) => void;
+    }) | undefined;
+    if (!axis) {
+      return;
+    }
+    axis.removePlotLine("selection");
+    axis.removePlotBand("selection");
+    const narrowed = start > 0 || end < points.length - 1;
+    if (!narrowed || points.length === 0) {
+      return;
+    }
+    const from = points[start]?.[0] ?? 0;
+    const to = points[end]?.[0] ?? from;
+    if (start === end) {
+      axis.addPlotLine({ id: "selection", value: from, color: "#111111", width: 2, zIndex: 5 });
+    } else {
+      axis.addPlotBand({ id: "selection", from, to, color: "rgba(21, 32, 51, 0.14)" });
+    }
+  }, [chart, end, points, start]);
+
+  return <HighchartsReact highcharts={Highcharts} options={options} callback={setChart} />;
+}
+
+export function OarlockChart({
+  mode,
+  current,
+  average,
+  yMax = 2000,
+  height = 188,
+}: {
+  mode: "oarlock" | "footboard";
+  current: Array<[number, number]>;
+  average: Array<[number, number]>;
+  yMax?: number;
+  height?: number;
+}) {
+  const options = useMemo<Highcharts.Options>(() => {
+    const currentName = mode === "footboard" ? "Footboard (selected)" : "Oarlock (selected)";
+    const averageName = mode === "footboard" ? "Footboard (session)" : "Oarlock (session)";
+
+    return {
+      chart: baseChart(height, 8),
+      title: { text: undefined },
+      credits: { enabled: false },
+      legend: { enabled: false },
+      tooltip: {
+        ...tooltip(),
+        valueSuffix: " N",
+      },
+      ...axes("Force (N)", yMax, "Stroke Position (%)"),
       xAxis: {
         ...axes("", yMax, "Stroke Position (%)").xAxis,
         min: 0,
@@ -227,15 +456,15 @@ export function OarlockChart({ mode, peak }: { mode: "oarlock" | "footboard" | "
         tickInterval: 20,
       },
       yAxis: {
-        ...axes(mode === "percent" ? "Footboard %" : "Force (N)", yMax, "").yAxis,
-        tickInterval: mode === "percent" ? 20 : undefined,
+        ...axes("Force (N)", yMax, "").yAxis,
+        tickInterval: yMax > 800 ? 500 : 200,
       },
       plotOptions: sharedPlot,
       series: [
         {
           type: "line",
           name: averageName,
-          data: forceShape(Math.round(scale * 0.86), 0.03),
+          data: average,
           color: "#98a6b8",
           dashStyle: "Dash",
           lineWidth: 1.5,
@@ -243,7 +472,7 @@ export function OarlockChart({ mode, peak }: { mode: "oarlock" | "footboard" | "
         {
           type: "areaspline",
           name: currentName,
-          data: forceShape(scale),
+          data: current,
           color: mode === "footboard" ? "#22a06b" : blue,
           lineWidth: 2.2,
           fillColor: {
@@ -256,7 +485,7 @@ export function OarlockChart({ mode, peak }: { mode: "oarlock" | "footboard" | "
         },
       ],
     };
-  }, [mode, peak]);
+  }, [average, current, height, mode, yMax]);
 
   return <HighchartsReact highcharts={Highcharts} options={options} />;
 }

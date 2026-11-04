@@ -1,1 +1,4 @@
 /Users/ethanxia/Desktop/Impulse/images/Screenshot 2026-10-26 at 11.14.34 PM.png
+__pycache__/
+*.pyc
+/image_db/

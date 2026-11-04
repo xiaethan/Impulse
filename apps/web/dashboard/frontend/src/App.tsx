@@ -1,169 +1,277 @@
-import { useEffect, useState } from "react";
-import { initialsFromEmail, useAuth } from "./auth";
-import { ComparisonChart, Donut, ForceCurveChart, OarlockChart, PeakBarChart, TrendChart } from "./charts";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
+import { initialsFromEmail, useAuth, type Account } from "./auth";
+import { AuthFrame, DocView, SiteFooter, type DocId } from "./legal";
+import { ForceCurveChart, OarlockChart, PeakBarChart, PowerChart, selectionCurve, seriesPeak, sessionCurve, type SensorSample } from "./charts";
 import {
-  BOATS,
-  CREWS,
+  ATHLETES,
   PAST_SESSIONS,
   SESSION,
-  WORKOUTS,
   crewPeak,
   formatNumber,
   insightsFor,
   rosterFor,
-  strokesFor,
   type Athlete,
-  type Crew,
   type InsightTone,
 } from "./data";
 
-type Page = "dashboard" | "live" | "athletes" | "sessions" | "analytics";
-type Status = "loading" | "ok" | "down";
-type OarMode = "oarlock" | "footboard" | "percent";
-type TrendMode = "force" | "impulse" | "speed";
+type Page = "dashboard" | "live" | "analytics" | "team" | "profile" | "settings";
+type OarMode = "oarlock" | "footboard";
 
 const PAGES: Array<{ id: Page; label: string }> = [
   { id: "dashboard", label: "Dashboard" },
-  { id: "live", label: "Live Session" },
-  { id: "athletes", label: "Athletes" },
-  { id: "sessions", label: "Sessions" },
-  { id: "analytics", label: "Team Analytics" },
+  { id: "live", label: "View" },
+  { id: "analytics", label: "Analytics" },
 ];
 
 export function App() {
   const [page, setPage] = useState<Page>("dashboard");
-  const [status, setStatus] = useState<Status>("loading");
-  const [crewId, setCrewId] = useState(CREWS[0].id);
-  const [boat, setBoat] = useState(BOATS[0]);
-  const [workout, setWorkout] = useState(WORKOUTS[0]);
+  const [boatId, setBoatId] = useState("");
   const [selectedId, setSelectedId] = useState("ethan");
-  const [paused, setPaused] = useState(false);
   const [oarMode, setOarMode] = useState<OarMode>("oarlock");
-  const [trendMode, setTrendMode] = useState<TrendMode>("force");
-  const [teamOpen, setTeamOpen] = useState(false);
+  const [activeSessionId, setActiveSessionId] = useState("");
   const [profileOpen, setProfileOpen] = useState(false);
-  const { email, logout } = useAuth();
-  const initials = initialsFromEmail(email);
+  const [teamCode, setTeamCode] = useState("");
+  const [joinError, setJoinError] = useState("");
+  const [joining, setJoining] = useState(false);
+  const [teamScreen, setTeamScreen] = useState(false);
+  const [teamName, setTeamName] = useState("");
+  const [teamLocation, setTeamLocation] = useState("");
+  const [createError, setCreateError] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [doc, setDoc] = useState<DocId | null>(null);
+  const { userId, email, username, role, team, logout, joinTeam, createTeam, applyAccount } = useAuth();
+  const initials = initialsFromEmail(username || email);
 
-  const crew = CREWS.find((item) => item.id === crewId) ?? CREWS[0];
-  const roster = rosterFor(crew.seats);
-  const athlete = roster.find((item) => item.id === selectedId) ?? roster[0];
-  const monitoring = page === "dashboard" || page === "live";
-
-  useEffect(() => {
-    let active = true;
-    fetch("/api/health")
-      .then((response) => (response.ok ? ("ok" as const) : ("down" as const)))
-      .then((next) => {
-        if (active) {
-          setStatus(next);
-        }
-      })
-      .catch(() => {
-        if (active) {
-          setStatus("down");
-        }
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
+  const mySessions = useMySessions(userId);
 
   useEffect(() => {
-    const visible = rosterFor(crew.seats);
-    if (!visible.some((item) => item.id === selectedId)) {
-      setSelectedId(visible[0].id);
+    if (mySessions.some((session) => session.sessionId === activeSessionId)) {
+      return;
     }
-  }, [crew.seats, selectedId]);
+    const preferred = mySessions.find((session) => session.id === "now") ?? mySessions[0];
+    setActiveSessionId(preferred?.sessionId ?? "");
+  }, [activeSessionId, mySessions]);
+  const [teamBoats, setTeamBoats] = useTeamBoats(userId);
+  const selectedBoat = teamBoats.find((item) => item.id === boatId) ?? teamBoats[0];
+  const analyticsRoster = rosterFor(seatsFor(selectedBoat?.shellType));
+  const lineup = [...(selectedBoat?.seats ?? [])].sort((a, b) => b.number - a.number);
+  const chartRoster = lineup.map((seat) => viewAthlete(seat));
+  const self = { ...(ATHLETES.find((item) => item.id === "ethan") ?? ATHLETES[0]), id: userId, name: accountName(email) };
+  const athlete = role === "athlete" ? self : (chartRoster.find((item) => item.id === selectedId) ?? chartRoster[0] ?? self);
+  const monitoring = page === "live";
+  const navPages = role === "coach" ? [...PAGES, { id: "team" as const, label: "Team" }] : PAGES;
 
-  function chooseCrew(next: Crew) {
-    setCrewId(next.id);
-    const visible = rosterFor(next.seats);
-    if (!visible.some((item) => item.id === selectedId)) {
-      setSelectedId(visible[0].id);
+  useEffect(() => {
+    if (teamBoats.length > 0 && !teamBoats.some((item) => item.id === boatId)) {
+      setBoatId(teamBoats[0].id);
+    }
+  }, [boatId, teamBoats]);
+
+  useEffect(() => {
+    if (role !== "coach") {
+      return;
+    }
+    const numbers = selectedBoat?.seats.map((seat) => seat.number) ?? [];
+    if (numbers.length === 0 || numbers.some((number) => String(number) === selectedId)) {
+      return;
+    }
+    setSelectedId(String(Math.max(...numbers)));
+  }, [role, selectedBoat?.seats, selectedId]);
+
+  function closeMenus() {
+    setProfileOpen(false);
+  }
+
+  function openPage(next: Page) {
+    closeMenus();
+    setTeamScreen(false);
+    setDoc(null);
+    setPage(next);
+  }
+
+  function openDoc(next: DocId) {
+    closeMenus();
+    setTeamScreen(false);
+    setDoc(next);
+  }
+
+  async function renameSeat(boatIdToUpdate: string, seat: number, name: string) {
+    if (!boatIdToUpdate) {
+      return;
+    }
+    const response = await fetch(`/api/boats/${boatIdToUpdate}/seats`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seat, name }),
+    });
+    const body = (await response.json()) as { seats?: BoatSeat[]; error?: string };
+    if (!response.ok) {
+      throw new Error(body.error ?? "Could not rename that seat.");
+    }
+    setTeamBoats((current) =>
+      current.map((boat) => (boat.id === boatIdToUpdate ? { ...boat, seats: normalizeSeats(boat.shellType, body.seats) } : boat)),
+    );
+  }
+
+  async function submitTeamCode(event: FormEvent) {
+    event.preventDefault();
+    setJoinError("");
+    setJoining(true);
+    try {
+      await joinTeam(teamCode);
+      setTeamCode("");
+    } catch (caught) {
+      setJoinError(caught instanceof Error ? caught.message : "Could not join that team.");
+    } finally {
+      setJoining(false);
     }
   }
 
-  function closeMenus() {
-    setTeamOpen(false);
-    setProfileOpen(false);
+  async function submitTeam(event: FormEvent) {
+    event.preventDefault();
+    setCreateError("");
+    setCreating(true);
+    try {
+      await createTeam({ name: teamName, location: teamLocation });
+      setTeamName("");
+      setTeamLocation("");
+    } catch (caught) {
+      setCreateError(caught instanceof Error ? caught.message : "Could not create that team.");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  if (!doc && role === "athlete" && !team) {
+    return (
+      <AuthFrame>
+        <form className="join-card" onSubmit={(event) => void submitTeamCode(event)}>
+          <img className="auth-logo" src="/impulse-logo.png?v=2" alt="Impulse" />
+          <h1>Join a team</h1>
+          <p>Ask a coach or a captain for the 4 digit access code.</p>
+          {joinError && (
+            <p className="auth-error" role="alert">
+              {joinError}
+            </p>
+          )}
+          <label className="auth-field">
+            <span>Access code</span>
+            <input
+              value={teamCode}
+              onChange={(event) => setTeamCode(event.target.value.toUpperCase())}
+              autoComplete="off"
+              maxLength={4}
+              required
+            />
+          </label>
+          <button className={joining ? "auth-submit busy" : "auth-submit"} type="submit" disabled={joining}>
+            {joining ? "Joining" : "Join team"}
+          </button>
+          <button className="ghost" type="button" onClick={() => void logout()}>
+            Log out
+          </button>
+        </form>
+      </AuthFrame>
+    );
+  }
+
+  if (!doc && role === "coach" && !team) {
+    return (
+      <AuthFrame>
+        <form className="join-card" onSubmit={(event) => void submitTeam(event)}>
+          <img className="auth-logo" src="/impulse-logo.png?v=2" alt="Impulse" />
+          <h1>Create a team</h1>
+          <p>Add the team details. A 4-character code is assigned when the team is saved.</p>
+          {createError && (
+            <p className="auth-error" role="alert">
+              {createError}
+            </p>
+          )}
+          <label className="auth-field">
+            <span>Team name</span>
+            <input value={teamName} onChange={(event) => setTeamName(event.target.value)} required />
+          </label>
+          <label className="auth-field">
+            <span>Location</span>
+            <input
+              value={teamLocation}
+              onChange={(event) => setTeamLocation(event.target.value)}
+              placeholder="City or boathouse"
+            />
+          </label>
+          <button className={creating ? "auth-submit busy" : "auth-submit"} type="submit" disabled={creating}>
+            {creating ? "Creating team" : "Create team"}
+          </button>
+          <button className="ghost" type="button" onClick={() => void logout()}>
+            Log out
+          </button>
+        </form>
+      </AuthFrame>
+    );
   }
 
   return (
     <div className="shell">
       <header className="topbar">
-        <button className="brand" type="button" aria-label="Impulse" onClick={() => setPage("dashboard")}>
-          <img src="/impulse-logo.png?v=2" alt="Impulse" />
-        </button>
-        <nav className="nav" aria-label="Primary">
-          {PAGES.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              aria-current={page === item.id ? "page" : undefined}
-              onClick={() => {
-                closeMenus();
-                setPage(item.id);
-              }}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
+        <div className="top-start">
+          <button className="brand" type="button" aria-label="Impulse" onClick={() => openPage("dashboard")}>
+            <img src="/impulse-logo.png?v=2" alt="Impulse" />
+          </button>
+          <nav className="nav" aria-label="Primary">
+            {navPages.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                aria-current={!teamScreen && !doc && page === item.id ? "page" : undefined}
+                onClick={() => openPage(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </nav>
+        </div>
         <div className="top-actions">
-          <span className="live-pill" data-status={status}>
-            <span className="live-dot" />
-            {status === "ok" && "Recording Live"}
-            {status === "loading" && "Connecting"}
-            {status === "down" && "Offline"}
-          </span>
-          <div className="menu-wrap">
+          {role === "athlete" && team && <span className="team team-name">{team.name || "Team"}</span>}
+          {role === "coach" && (
             <button
               className="team"
               type="button"
-              aria-expanded={teamOpen}
               onClick={() => {
-                setTeamOpen((open) => !open);
-                setProfileOpen(false);
+                closeMenus();
+                setTeamScreen(true);
               }}
             >
-              <PennMark />
-              <span>{SESSION.team}</span>
-              <Chevron />
+              <span className="join-plus" aria-hidden="true">+</span>
+              <span>{team?.name || team?.code || "Create Team"}</span>
             </button>
-            {teamOpen && (
-              <div className="menu" role="menu">
-                <p className="menu-label">Team</p>
-                <button className="menu-item current" type="button" role="menuitem" onClick={closeMenus}>
-                  <PennMark />
-                  {SESSION.team}
-                </button>
-              </div>
-            )}
-          </div>
+          )}
           <div className="menu-wrap">
             <button
               className="profile"
               type="button"
+              aria-label="Account"
               aria-expanded={profileOpen}
               onClick={() => {
                 setProfileOpen((open) => !open);
-                setTeamOpen(false);
               }}
             >
               <span className="avatar">{initials}</span>
-              <span>Coach</span>
             </button>
             {profileOpen && (
               <div className="menu profile-menu" role="menu">
-                <p className="menu-label">Profile</p>
                 <div className="profile-card">
                   <span className="avatar">{initials}</span>
-                  <span>
-                    <strong>Coach</strong>
-                    <small>{email}</small>
-                  </span>
+                  <div>
+                    <strong>{username || email}</strong>
+                    {username && <small>{email}</small>}
+                  </div>
                 </div>
+                <button className="menu-item" type="button" role="menuitem" onClick={() => openPage("profile")}>
+                  Profile
+                </button>
+                <button className="menu-item" type="button" role="menuitem" onClick={() => openPage("settings")}>
+                  Settings
+                </button>
                 <button
                   className="menu-item logout"
                   type="button"
@@ -180,147 +288,645 @@ export function App() {
           </div>
         </div>
       </header>
-      {(teamOpen || profileOpen) && <button className="backdrop" type="button" aria-label="Close menu" onClick={closeMenus} />}
-      <div className={monitoring ? "body" : "body wide"}>
+      {profileOpen && <button className="backdrop" type="button" aria-label="Close menu" onClick={closeMenus} />}
+      {doc ? (
+        <DocView id={doc} signedIn onOpen={openDoc} />
+      ) : teamScreen && role === "coach" ? (
+        <main className="team-screen">
+          {team ? (
+            <section className="team-form">
+              <h1>{team.name}</h1>
+              {team.location && <p className="auth-lead">{team.location}</p>}
+              <p className="auth-lead">Athletes join with this code.</p>
+              <p className="team-code">{team.code}</p>
+              <button className="auth-submit" type="button" onClick={() => setTeamScreen(false)}>
+                Back to dashboard
+              </button>
+            </section>
+          ) : (
+            <form className="team-form" onSubmit={(event) => void submitTeam(event)}>
+              <h1>Create a team</h1>
+              <p className="auth-lead">Add the team details. A 4-character code is assigned when the team is saved.</p>
+              {createError && (
+                <p className="auth-error" role="alert">
+                  {createError}
+                </p>
+              )}
+              <label className="auth-field">
+                <span>Team name</span>
+                <input value={teamName} onChange={(event) => setTeamName(event.target.value)} required />
+              </label>
+              <label className="auth-field">
+                <span>Location</span>
+                <input
+                  value={teamLocation}
+                  onChange={(event) => setTeamLocation(event.target.value)}
+                  placeholder="City or boathouse"
+                />
+              </label>
+              <div className="team-actions">
+                <button className="ghost" type="button" onClick={() => setTeamScreen(false)}>
+                  Cancel
+                </button>
+                <button className={creating ? "auth-submit busy" : "auth-submit"} type="submit" disabled={creating}>
+                  {creating ? "Creating team" : "Create team"}
+                </button>
+              </div>
+            </form>
+          )}
+        </main>
+      ) : page === "dashboard" ? (
+        team ? (
+          <HomeView
+            role={role === "coach" ? "coach" : "athlete"}
+            sessions={mySessions}
+            boats={teamBoats}
+            setBoats={setTeamBoats}
+            onOpenSession={(sessionId) => {
+              setActiveSessionId(sessionId);
+              openPage("live");
+            }}
+          />
+        ) : (
+          <main className="blank-dashboard" />
+        )
+      ) : page === "profile" ? (
+        <ProfilePage onAccount={applyAccount} />
+      ) : page === "settings" ? (
+        <SettingsPage />
+      ) : page === "team" && role === "coach" ? (
+        <TeamPage />
+      ) : (
+      <div className={monitoring ? "body wide view-fit" : "body wide"}>
         <Sidebar
-          crew={crew}
-          boat={boat}
-          workout={workout}
-          roster={roster}
-          selectedId={athlete.id}
-          onCrew={chooseCrew}
-          onBoat={setBoat}
-          onWorkout={setWorkout}
+          boats={teamBoats}
+          boatId={selectedBoat?.id ?? ""}
+          seats={lineup}
+          selectedId={selectedId}
+          personal={role === "athlete"}
+          onBoat={setBoatId}
           onSelect={setSelectedId}
+          onRenameSeat={(seat, name) => renameSeat(selectedBoat?.id ?? "", seat, name)}
         />
         <main className="stage">
           {monitoring ? (
             <LiveBoard
               athlete={athlete}
-              roster={roster}
-              crew={crew}
-              boat={boat}
-              workout={workout}
-              paused={paused}
+              roster={chartRoster}
+              boat={selectedBoat ? `${selectedBoat.name} · ${selectedBoat.shellType}` : "No boat"}
+              personal={role === "athlete"}
+              sessionId={activeSessionId}
               oarMode={oarMode}
-              trendMode={trendMode}
-              onPause={() => setPaused((value) => !value)}
               onOar={setOarMode}
-              onTrend={setTrendMode}
-            />
-          ) : page === "athletes" ? (
-            <AthletesPage roster={roster} selectedId={athlete.id} onSelect={setSelectedId} />
-          ) : page === "sessions" ? (
-            <SessionsPage
-              workout={workout}
-              onOpen={(name) => {
-                if (WORKOUTS.includes(name)) {
-                  setWorkout(name);
-                }
-                setPage("live");
-              }}
             />
           ) : (
-            <AnalyticsPage roster={roster} />
+            <AnalyticsPage roster={analyticsRoster} athlete={role === "athlete" ? athlete : undefined} />
           )}
         </main>
-        {monitoring && <Metrics athlete={athlete} />}
+      </div>
+      )}
+      <SiteFooter current={doc} onOpen={openDoc} />
+    </div>
+  );
+}
+
+const SHELL_TYPES = ["8+", "4+", "4-", "2-"] as const;
+type ShellType = (typeof SHELL_TYPES)[number];
+type BoatSeat = { number: number; name: string };
+type Boat = { id: string; name: string; coachId: string; shellType: ShellType; notes: string; seats: BoatSeat[] };
+type BoatDraft = { id: string | null; name: string; shellType: ShellType; notes: string };
+
+function seatsFor(shell: string | undefined) {
+  if (shell === "4+" || shell === "4-") {
+    return 4;
+  }
+  if (shell === "2-") {
+    return 2;
+  }
+  return 8;
+}
+
+function isShellType(value: string): value is ShellType {
+  return (SHELL_TYPES as readonly string[]).includes(value);
+}
+
+function seatMark(number: number, count: number) {
+  if (number === count) {
+    return "Stroke";
+  }
+  if (number === 1) {
+    return "Bow";
+  }
+  return String(number);
+}
+
+function normalizeSeats(shellType: ShellType, seats: unknown): BoatSeat[] {
+  const count = seatsFor(shellType);
+  const incoming = Array.isArray(seats)
+    ? seats.flatMap((seat) => {
+        if (!seat || typeof seat !== "object") {
+          return [];
+        }
+        const number = Number((seat as { number?: unknown }).number);
+        const name = String((seat as { name?: unknown }).name ?? "");
+        if (!Number.isInteger(number) || number < 1 || number > count) {
+          return [];
+        }
+        return [{ number, name }];
+      })
+    : [];
+  return Array.from({ length: count }, (_, index) => {
+    const number = index + 1;
+    return incoming.find((seat) => seat.number === number) ?? { number, name: "" };
+  });
+}
+
+function viewAthlete(seat: BoatSeat): Athlete {
+  const template = ATHLETES.find((item) => item.seat === seat.number) ?? ATHLETES[0];
+  return {
+    ...template,
+    id: String(seat.number),
+    seat: seat.number,
+    name: seat.name.trim() || "Empty",
+    detail: "",
+  };
+}
+type PastSession = (typeof PAST_SESSIONS)[number];
+type LinkedSession = PastSession & { sessionId: string };
+type TeamAthlete = { id: string; email: string; username: string | null };
+
+function accountName(email: string) {
+  return email.split("@")[0] || email;
+}
+
+function normalizeBoat(boat: { id: string; name: string; coachId: string; shellType?: string; notes?: string; seats?: unknown }): Boat {
+  const shellType = boat.shellType && isShellType(boat.shellType) ? boat.shellType : "8+";
+  return {
+    id: boat.id,
+    name: boat.name,
+    coachId: boat.coachId,
+    shellType,
+    notes: boat.notes ?? "",
+    seats: normalizeSeats(shellType, boat.seats),
+  };
+}
+
+function useTeamBoats(userId: string): [Boat[], Dispatch<SetStateAction<Boat[]>>] {
+  const [boats, setBoats] = useState<Boat[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/boats")
+      .then(async (response) => {
+        if (!response.ok) {
+          return { boats: [] as Boat[] };
+        }
+        return (await response.json()) as { boats: Array<Omit<Boat, "shellType" | "seats"> & { shellType?: string; seats?: unknown }> };
+      })
+      .then((body) => {
+        if (active) {
+          setBoats(body.boats.map(normalizeBoat));
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setBoats([]);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+
+  return [boats, setBoats];
+}
+
+function useMySessions(userId: string) {
+  const [sessions, setSessions] = useState<LinkedSession[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/practice-sessions")
+      .then(async (response) => {
+        if (!response.ok) {
+          return { sessions: [] as Array<{ id: string; mockId: string }> };
+        }
+        return (await response.json()) as { sessions: Array<{ id: string; mockId: string }> };
+      })
+      .then((body) => {
+        if (!active) {
+          return;
+        }
+        const ids = new Map(body.sessions.map((session) => [session.mockId, session.id]));
+        setSessions(
+          PAST_SESSIONS.flatMap((session) => {
+            const sessionId = ids.get(session.id);
+            return sessionId ? [{ ...session, sessionId }] : [];
+          }),
+        );
+      })
+      .catch(() => {
+        if (active) {
+          setSessions([]);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+
+  return sessions;
+}
+
+function sessionDate(when: string) {
+  const today = new Date();
+  if (when.startsWith("Today")) {
+    return today.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+  }
+  if (when.startsWith("Yesterday")) {
+    const yesterday = new Date(today);
+    yesterday.setDate(today.getDate() - 1);
+    return yesterday.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+  }
+  return when;
+}
+
+function sessionSummary(distance: string, meta: string) {
+  const meters = distance.match(/^([\d,]+)\s*m$/i);
+  const kilometers = distance.match(/^([\d.]+)\s*km$/i);
+  const label = meters
+    ? `${(Number(meters[1].replaceAll(",", "")) / 1000).toFixed(1)}KM`
+    : kilometers
+      ? `${kilometers[1]}KM`
+      : distance;
+  const minutes = meta.match(/\d+/);
+  return `${label} | ${minutes?.[0] ?? meta}:00 Duration`;
+}
+
+function HomeView({
+  role,
+  sessions,
+  boats,
+  setBoats,
+  onOpenSession,
+}: {
+  role: "athlete" | "coach";
+  sessions: LinkedSession[];
+  boats: Boat[];
+  setBoats: Dispatch<SetStateAction<Boat[]>>;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const [boatError, setBoatError] = useState("");
+  const [savingBoat, setSavingBoat] = useState(false);
+  const [menuBoatId, setMenuBoatId] = useState<string | null>(null);
+  const [editor, setEditor] = useState<BoatDraft | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const detail = boats.find((boat) => boat.id === detailId);
+
+  async function saveBoat(event: FormEvent) {
+    event.preventDefault();
+    if (!editor) {
+      return;
+    }
+    setBoatError("");
+    setSavingBoat(true);
+    try {
+      const response = await fetch(editor.id ? `/api/boats/${editor.id}` : "/api/boats", {
+        method: editor.id ? "PATCH" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: editor.name, shellType: editor.shellType, notes: editor.notes }),
+      });
+      const body = (await response.json()) as (Boat & { error?: string; shellType?: string }) | { error?: string };
+      if (!response.ok || !("id" in body)) {
+        throw new Error(("error" in body && body.error) || "Could not save that boat.");
+      }
+      const saved = normalizeBoat(body);
+      setBoats((current) => (editor.id ? current.map((boat) => (boat.id === saved.id ? saved : boat)) : [...current, saved]));
+      setEditor(null);
+    } catch (caught) {
+      setBoatError(caught instanceof Error ? caught.message : "Could not save that boat.");
+    } finally {
+      setSavingBoat(false);
+    }
+  }
+
+  async function deleteBoat(id: string) {
+    setBoatError("");
+    setMenuBoatId(null);
+    const response = await fetch(`/api/boats/${id}`, { method: "DELETE" });
+    if (!response.ok) {
+      const body = (await response.json()) as { error?: string };
+      setBoatError(body.error ?? "Could not delete that boat.");
+      return;
+    }
+    setBoats((current) => current.filter((boat) => boat.id !== id));
+    if (detailId === id) {
+      setDetailId(null);
+    }
+    if (editor?.id === id) {
+      setEditor(null);
+    }
+  }
+
+  function openEditor(boat?: Boat) {
+    setMenuBoatId(null);
+    setDetailId(null);
+    setBoatError("");
+    setEditor(
+      boat
+        ? { id: boat.id, name: boat.name, shellType: boat.shellType, notes: boat.notes }
+        : { id: null, name: "", shellType: "8+", notes: "" },
+    );
+  }
+
+  return (
+    <main className="home">
+      <section className="home-section">
+        <h2>Recent Sessions</h2>
+        <hr />
+        {sessions.length > 0 ? (
+          <div className="tile-row">
+            {sessions.map((item) => (
+              <button
+                key={item.id}
+                className="home-tile"
+                type="button"
+                onClick={() => onOpenSession(item.sessionId)}
+              >
+                <span className="tile-date">{sessionDate(item.when)}</span>
+                <span className="tile-caption">{sessionSummary(item.distance, item.meta)}</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="session-empty">No sessions are linked to this account yet.</p>
+        )}
+      </section>
+      {role === "coach" && (
+        <section className="home-section">
+          <h2>Boat View</h2>
+          <hr />
+          {boatError && (
+            <p className="auth-error" role="alert">
+              {boatError}
+            </p>
+          )}
+          <div className="tile-row">
+            {boats.map((boat) => (
+              <div className={menuBoatId === boat.id ? "home-tile menu-open" : "home-tile"} key={boat.id}>
+                <button
+                  className="boat-open"
+                  type="button"
+                  aria-label={`Details for ${boat.name}`}
+                  onClick={() => setDetailId(boat.id)}
+                />
+                <button
+                  className="boat-more"
+                  type="button"
+                  aria-label={`Options for ${boat.name}`}
+                  aria-expanded={menuBoatId === boat.id}
+                  onClick={() => setMenuBoatId((current) => (current === boat.id ? null : boat.id))}
+                >
+                  ···
+                </button>
+                {menuBoatId === boat.id && (
+                  <div className="boat-menu" role="menu">
+                    <button type="button" role="menuitem" onClick={() => openEditor(boat)}>
+                      Edit
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => void deleteBoat(boat.id)}>
+                      Delete
+                    </button>
+                  </div>
+                )}
+                <span className="tile-label">{boat.name}</span>
+              </div>
+            ))}
+            <button className="home-tile add-boat" type="button" onClick={() => openEditor()}>
+              <span className="add-boat-plus">+</span>
+              <span className="tile-label">Add a Boat</span>
+            </button>
+          </div>
+          {menuBoatId && (
+            <button className="boat-menu-backdrop" type="button" aria-label="Close boat menu" onClick={() => setMenuBoatId(null)} />
+          )}
+          {detail && <BoatDetail boat={detail} onClose={() => setDetailId(null)} onEdit={() => openEditor(detail)} />}
+          {editor && (
+            <form className="boat-dialog" onSubmit={(event) => void saveBoat(event)}>
+              <button className="boat-dialog-backdrop" type="button" aria-label="Close" onClick={() => setEditor(null)} />
+              <div className="boat-dialog-card">
+                <h3>{editor.id ? "Edit boat" : "Add a boat"}</h3>
+                {boatError && (
+                  <p className="auth-error" role="alert">
+                    {boatError}
+                  </p>
+                )}
+                <label>
+                  <span>Boat name</span>
+                  <input
+                    value={editor.name}
+                    onChange={(event) => setEditor({ ...editor, name: event.target.value })}
+                    maxLength={80}
+                    required
+                    autoFocus
+                  />
+                </label>
+                <label>
+                  <span>Type of boat</span>
+                  <select
+                    value={editor.shellType}
+                    onChange={(event) => {
+                      const shellType = event.target.value;
+                      if (isShellType(shellType)) {
+                        setEditor({ ...editor, shellType });
+                      }
+                    }}
+                  >
+                    {SHELL_TYPES.map((shell) => (
+                      <option key={shell} value={shell}>
+                        {shell}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Notes</span>
+                  <textarea
+                    value={editor.notes}
+                    onChange={(event) => setEditor({ ...editor, notes: event.target.value })}
+                    maxLength={500}
+                    placeholder="Optional notes about this boat"
+                  />
+                </label>
+                <div className="boat-form-actions">
+                  <button className="ghost" type="button" onClick={() => setEditor(null)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={savingBoat}>
+                    {savingBoat ? "Saving" : "Save"}
+                  </button>
+                </div>
+              </div>
+            </form>
+          )}
+        </section>
+      )}
+    </main>
+  );
+}
+
+function BoatDetail({ boat, onClose, onEdit }: { boat: Boat; onClose: () => void; onEdit: () => void }) {
+  return (
+    <div className="boat-dialog">
+      <button className="boat-dialog-backdrop" type="button" aria-label="Close boat details" onClick={onClose} />
+      <div className="boat-dialog-card" role="dialog" aria-labelledby="boat-detail-title">
+        <h3 id="boat-detail-title">{boat.name}</h3>
+        <dl className="boat-detail">
+          <div>
+            <dt>Type of boat</dt>
+            <dd>{boat.shellType}</dd>
+          </div>
+          <div>
+            <dt>Notes</dt>
+            <dd>{boat.notes || "No notes yet."}</dd>
+          </div>
+        </dl>
+        <div className="boat-form-actions">
+          <button className="ghost" type="button" onClick={onClose}>
+            Close
+          </button>
+          <button className="boat-primary" type="button" onClick={onEdit}>
+            Edit
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
 function Sidebar({
-  crew,
-  boat,
-  workout,
-  roster,
+  boats,
+  boatId,
+  seats,
   selectedId,
-  onCrew,
+  personal,
   onBoat,
-  onWorkout,
   onSelect,
+  onRenameSeat,
 }: {
-  crew: Crew;
-  boat: string;
-  workout: string;
-  roster: Athlete[];
+  boats: Boat[];
+  boatId: string;
+  seats: BoatSeat[];
   selectedId: string;
-  onCrew: (crew: Crew) => void;
-  onBoat: (boat: string) => void;
-  onWorkout: (workout: string) => void;
+  personal: boolean;
+  onBoat: (boatId: string) => void;
   onSelect: (id: string) => void;
+  onRenameSeat: (seat: number, name: string) => Promise<void>;
 }) {
+  const [rename, setRename] = useState<{ number: number; name: string; x: number; y: number; error: string } | null>(null);
+  const [savingName, setSavingName] = useState(false);
+
+  async function saveName(event: FormEvent) {
+    event.preventDefault();
+    if (!rename) {
+      return;
+    }
+    setSavingName(true);
+    try {
+      await onRenameSeat(rename.number, rename.name);
+      setRename(null);
+    } catch (caught) {
+      setRename({ ...rename, error: caught instanceof Error ? caught.message : "Could not rename that seat." });
+    } finally {
+      setSavingName(false);
+    }
+  }
+
   return (
     <aside className="sidebar">
       <label className="field">
-        <span>Crew</span>
-        <select value={crew.id} onChange={(event) => onCrew(CREWS.find((item) => item.id === event.target.value) ?? CREWS[0])}>
-          {CREWS.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.label}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="field">
         <span>Boat</span>
-        <select value={boat} onChange={(event) => onBoat(event.target.value)}>
-          {BOATS.map((item) => (
-            <option key={item} value={item}>
-              {item}
-            </option>
-          ))}
+        <select value={boatId} onChange={(event) => onBoat(event.target.value)} disabled={boats.length === 0}>
+          {boats.length === 0 ? (
+            <option value="">No boats yet</option>
+          ) : (
+            boats.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))
+          )}
         </select>
       </label>
-      <div className="athlete-list">
-        {roster.map((item) => {
-          const selected = item.id === selectedId;
+      {!personal && <div className="athlete-list">
+        {seats.map((seat) => {
+          const selected = String(seat.number) === selectedId;
+          const label = seatMark(seat.number, seats.length);
           return (
             <button
-              key={item.id}
+              key={seat.number}
               type="button"
               className={selected ? "athlete selected" : "athlete"}
               aria-pressed={selected}
-              onClick={() => onSelect(item.id)}
+              aria-label={`${label}${seat.name ? `, ${seat.name}` : ", empty"}. Right-click to rename.`}
+              onClick={() => onSelect(String(seat.number))}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setRename({ number: seat.number, name: seat.name, x: event.clientX, y: event.clientY, error: "" });
+              }}
             >
-              <span className="seat-no">{item.seat}</span>
-              <span className="dot" style={{ background: item.color }} />
-              <span className="athlete-copy">
-                <span className="athlete-name">{item.name}</span>
-                {item.detail && <span className="athlete-role">{item.detail}</span>}
-              </span>
-              <span className="athlete-speed">{item.speedKmh.toFixed(1)} km/h</span>
+              <span className="seat-no">{label}</span>
+              <span className={seat.name ? "athlete-name" : "athlete-name empty"}>{seat.name || "Empty"}</span>
             </button>
           );
         })}
-      </div>
-      <BoatMap athletes={roster} selectedId={selectedId} onSelect={onSelect} />
-      <label className="workout-card">
-        <span>Workout</span>
-        <select value={workout} onChange={(event) => onWorkout(event.target.value)}>
-          {WORKOUTS.map((item) => (
-            <option key={item} value={item}>
-              {item}
-            </option>
-          ))}
-        </select>
-        <small>{SESSION.started}</small>
-      </label>
+      </div>}
+      {!personal && <BoatMap seats={seats} selectedId={selectedId} onSelect={onSelect} />}
+      {rename && (
+        <form
+          className="seat-rename"
+          style={{ left: Math.min(rename.x, window.innerWidth - 240), top: Math.min(rename.y, window.innerHeight - 160) }}
+          onSubmit={(event) => void saveName(event)}
+        >
+          <p>Rename rower</p>
+          {rename.error && (
+            <p className="auth-error" role="alert">
+              {rename.error}
+            </p>
+          )}
+          <input
+            value={rename.name}
+            onChange={(event) => setRename({ ...rename, name: event.target.value })}
+            maxLength={80}
+            placeholder="Rower name"
+            autoFocus
+            aria-label="Rower name"
+          />
+          <div className="boat-form-actions">
+            <button className="ghost" type="button" onClick={() => setRename(null)}>
+              Cancel
+            </button>
+            <button type="submit" disabled={savingName}>
+              {savingName ? "Saving" : "Save"}
+            </button>
+          </div>
+        </form>
+      )}
+      <SeatChat />
     </aside>
   );
 }
 
 function BoatMap({
-  athletes,
+  seats,
   selectedId,
   onSelect,
 }: {
-  athletes: Athlete[];
+  seats: BoatSeat[];
   selectedId: string;
   onSelect: (id: string) => void;
 }) {
-  const count = athletes.length;
+  const count = seats.length;
   return (
     <svg className="boat" viewBox="0 0 240 78" role="img" aria-label="Boat seats">
       <path
@@ -330,14 +936,15 @@ function BoatMap({
       />
       <path d="M46 40 H196" stroke="#d5deea" strokeWidth="1" />
       <path d="M230 40 H236" stroke="#9aabbd" strokeWidth="2" strokeLinecap="round" />
-      {athletes.map((athlete, index) => {
+      {seats.map((seat, index) => {
         const x = count === 1 ? 120 : 40 + index * (156 / (count - 1));
-        const selected = athlete.id === selectedId;
+        const selected = String(seat.number) === selectedId;
+        const label = count === 2 ? seatMark(seat.number, count) : String(seat.number);
         return (
-          <g key={athlete.id} className="boat-seat" onClick={() => onSelect(athlete.id)}>
-            <circle cx={x} cy={40} r={selected ? 8 : 6.5} fill={athlete.color} />
+          <g key={seat.number} className="boat-seat" onClick={() => onSelect(String(seat.number))}>
+            <circle cx={x} cy={40} r={selected ? 8 : 6.5} fill={selected ? "#2f6bff" : "#c5ced8"} />
             <text x={x} y={70} textAnchor="middle" fontSize="10" fill="#7b8798">
-              {athlete.seat}
+              {label}
             </text>
           </g>
         );
@@ -346,93 +953,162 @@ function BoatMap({
   );
 }
 
+function useBoxHeight() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState(160);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) {
+      return;
+    }
+    const update = () => setHeight(Math.max(96, Math.floor(node.clientHeight)));
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  return [ref, height] as const;
+}
+
+function clock(second: number) {
+  const total = Math.max(0, Math.round(second));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function LiveBoard({
   athlete,
   roster,
-  crew,
   boat,
-  workout,
-  paused,
+  personal,
+  sessionId,
   oarMode,
-  trendMode,
-  onPause,
   onOar,
-  onTrend,
 }: {
   athlete: Athlete;
   roster: Athlete[];
-  crew: Crew;
   boat: string;
-  workout: string;
-  paused: boolean;
+  personal: boolean;
+  sessionId: string;
   oarMode: OarMode;
-  trendMode: TrendMode;
-  onPause: () => void;
   onOar: (mode: OarMode) => void;
-  onTrend: (mode: TrendMode) => void;
 }) {
-  const neighbor =
-    roster.find((item) => item.seat === athlete.seat + 1) ?? roster.find((item) => item.seat === athlete.seat - 1);
-  const compared = neighbor ? [athlete, neighbor] : [athlete];
-  const strokes = strokesFor(athlete);
-  const average = crewPeak(roster);
-  const seatLabel =
-    compared.length === 2
-      ? `Seats ${Math.min(compared[0].seat, compared[1].seat)}–${Math.max(compared[0].seat, compared[1].seat)}`
-      : `Seat ${athlete.seat}`;
+  const [points, setPoints] = useState<Array<[number, number]> | null>(null);
+  const [samples, setSamples] = useState<SensorSample[]>([]);
+  const [range, setRange] = useState({ start: 0, end: 0 });
+  const [powerRef, powerHeight] = useBoxHeight();
+  const [forceRef, forceHeight] = useBoxHeight();
+  const [oarRef, oarHeight] = useBoxHeight();
+
+  useEffect(() => {
+    if (!sessionId) {
+      setPoints([]);
+      setSamples([]);
+      return;
+    }
+    setPoints(null);
+    let active = true;
+    fetch(`/api/telemetry?sessionId=${sessionId}`)
+      .then(async (response) => {
+        if (!response.ok) {
+          return { points: [] as Array<[number, number]> };
+        }
+        return (await response.json()) as { points: Array<[number, number]>; samples?: SensorSample[] };
+      })
+      .then((body) => {
+        if (active) {
+          setPoints(body.points ?? []);
+          setSamples(body.samples ?? []);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setPoints([]);
+          setSamples([]);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    setRange({ start: 0, end: Math.max(0, (points?.length ?? 0) - 1) });
+  }, [points]);
+
+  const series = points ?? [];
+  const slice = series.slice(range.start, range.end + 1);
+  const average = slice.length === 0 ? 0 : Math.round(slice.reduce((sum, point) => sum + point[1], 0) / slice.length);
+  const startPoint = series[range.start] ?? [0, 0];
+  const endPoint = series[range.end] ?? startPoint;
+  const single = range.start === range.end;
+  const windowLabel = points === null
+    ? "Loading"
+    : series.length === 0
+      ? "No sensor data"
+      : single
+        ? `${clock(startPoint[0])} · ${formatNumber(startPoint[1])} W`
+        : `${clock(startPoint[0])}–${clock(endPoint[0])} · ${formatNumber(average)} W avg`;
+  const subject = personal ? athlete.name : athlete.name === "Empty" ? seatMark(athlete.seat, roster.length) : `${seatMark(athlete.seat, roster.length)} — ${athlete.name}`;
+  const forceAverage = useMemo(() => sessionCurve(samples, "force"), [samples]);
+  const footboardAverage = useMemo(() => sessionCurve(samples, "footboard"), [samples]);
+  const forceCurrent = useMemo(
+    () => (samples.length === 0 ? forceAverage : selectionCurve(samples, startPoint[0], endPoint[0], "force")),
+    [endPoint, forceAverage, samples, startPoint],
+  );
+  const footboardCurrent = useMemo(
+    () => (samples.length === 0 ? footboardAverage : selectionCurve(samples, startPoint[0], endPoint[0], "footboard")),
+    [endPoint, footboardAverage, samples, startPoint],
+  );
+  const forceMax = Math.max(200, seriesPeak(forceAverage), seriesPeak(forceCurrent));
+  const footboardMax = Math.max(200, seriesPeak(footboardAverage), seriesPeak(footboardCurrent));
+  const forceY = Math.ceil((forceMax * 1.12) / 100) * 100;
+  const footboardY = Math.ceil((footboardMax * 1.12) / 100) * 100;
+  const lowerCurrent = oarMode === "footboard" ? footboardCurrent : forceCurrent;
+  const lowerAverage = oarMode === "footboard" ? footboardAverage : forceAverage;
+  const lowerY = oarMode === "footboard" ? footboardY : forceY;
+  const insights = insightsFor(athlete);
 
   return (
     <div className="live">
-      <section className="card session-card">
-        <div className="session-top">
-          <div>
-            <h1>
-              Live Session
-              <span className={paused ? "badge paused" : "badge"}>{paused ? "Paused" : "In Progress"}</span>
-            </h1>
-            <p className="session-sub">
-              {crew.session} / {workout}
-              <span> · {boat}</span>
-            </p>
-          </div>
-          <div className="session-actions">
-            <button className={paused ? "record paused" : "record"} type="button" onClick={onPause}>
-              <i />
-              {paused ? "Paused" : "Recording"}
-            </button>
-            <button className="pause" type="button" aria-label={paused ? "Resume session" : "Pause session"} onClick={onPause}>
-              {paused ? <PlayIcon /> : <PauseIcon />}
-            </button>
-          </div>
+      <section className="card live-card">
+        <div className="card-head">
+          <h2>Data</h2>
+          <span className="card-sub">{boat} · {windowLabel}</span>
         </div>
-        <div className="stats">
-          <Stat label="Stroke Rate" value={`${SESSION.strokeRate} spm`} />
-          <Stat label="Boat Speed" value={`${SESSION.boatSpeed.toFixed(1)} m/s`} hint={`(${SESSION.boatSpeedKmh.toFixed(1)} km/h)`} />
-          <Stat label="Distance" value={`${formatNumber(SESSION.distance)} m`} />
-          <Stat label="Elapsed Time" value={SESSION.elapsed} />
+        <p className="card-sub">Click a moment, or drag across the session, to update the cards below.</p>
+        <div className="chart-fill" ref={powerRef}>
+          {series.length > 0 ? (
+            <PowerChart points={series} start={range.start} end={range.end} height={powerHeight} onPick={(start, end) => setRange({ start, end })} />
+          ) : (
+            <p className="card-sub">{points === null ? "Loading the session." : "No sensor data for this session."}</p>
+          )}
         </div>
       </section>
 
-      <div className="chart-row">
-        <section className="card">
-          <div className="card-head">
-            <h2>
-              Force Curve <InfoTip text="Force through the stroke, with the crew average and target range." />
-            </h2>
+      <section className="card live-card">
+        <div className="card-head">
+          <h2>
+            Force Curve <InfoTip text="Force through the stroke for the selected time, with the crew average." />
+          </h2>
             <Legend
-              items={[
-                { label: "Current Stroke", swatch: "line" },
-                { label: "Crew Average", swatch: "dashed" },
-                { label: "Target Range", swatch: "range" },
-              ]}
-            />
-          </div>
-          <p className="card-sub">
-            Seat {athlete.seat} — {athlete.name}
-          </p>
-          <ForceCurveChart peak={athlete.peakForce} />
-        </section>
-        <section className="card">
+            items={[
+              { label: "Selected", swatch: "line", color: "#2f6bff" },
+              { label: "Session average", swatch: "dashed" },
+            ]}
+          />
+        </div>
+        <p className="card-sub">{subject} · {windowLabel}</p>
+        <div className="chart-fill" ref={forceRef}>
+          <ForceCurveChart current={forceCurrent} average={forceAverage} yMax={forceY} height={forceHeight} />
+        </div>
+      </section>
+
+      <div className="live-split">
+        <section className="card live-card">
           <div className="card-head">
             <Tabs
               value={oarMode}
@@ -440,161 +1116,86 @@ function LiveBoard({
               options={[
                 { id: "oarlock", label: "Oarlock Force" },
                 { id: "footboard", label: "Footboard Force" },
-                { id: "percent", label: "Footboard %" },
               ]}
             />
           </div>
-          <OarlockChart mode={oarMode} peak={athlete.peakForce} />
-          <Legend
-            items={
-              oarMode === "percent"
-                ? [
-                    { label: "Footboard %", swatch: "line", color: "#2f6bff" },
-                    { label: "Crew average", swatch: "dashed" },
-                  ]
-                : [
-                    {
-                      label: oarMode === "footboard" ? "Footboard (current)" : "Oarlock (current)",
-                      swatch: "line",
-                      color: oarMode === "footboard" ? "#22a06b" : "#2f6bff",
-                    },
-                    { label: oarMode === "footboard" ? "Footboard (avg)" : "Oarlock (avg)", swatch: "dashed" },
-                  ]
-            }
-          />
-        </section>
-      </div>
-
-      <div className="lower">
-        <section className="card">
-          <div className="card-head">
-            <h2>
-              Athlete Comparison <span>{seatLabel}</span>
-            </h2>
+          <div className="chart-fill" ref={oarRef}>
+            <OarlockChart mode={oarMode} current={lowerCurrent} average={lowerAverage} yMax={lowerY} height={oarHeight} />
           </div>
           <Legend
             items={[
-              ...compared.map((item) => ({
-                label: `Seat ${item.seat} (${item.name})`,
-                swatch: "line" as const,
-                color: item.color,
-              })),
-              { label: "Crew Average", swatch: "dashed" as const },
+              {
+                label: oarMode === "footboard" ? "Footboard (selected)" : "Oarlock (selected)",
+                swatch: "line",
+                color: oarMode === "footboard" ? "#22a06b" : "#2f6bff",
+              },
+              { label: oarMode === "footboard" ? "Footboard (session)" : "Oarlock (session)", swatch: "dashed" },
             ]}
           />
-          <ComparisonChart athletes={compared} crew={average} />
         </section>
-        <section className="card">
-          <div className="card-head">
-            <h2>Recent Strokes (Seat {athlete.seat})</h2>
-          </div>
-          <div className="table-wrap">
-            <table className="strokes">
-              <thead>
-                <tr>
-                  <th>Stroke #</th>
-                  <th>Peak Force (N)</th>
-                  <th>Avg Force (N)</th>
-                  <th>Impulse (N·s)</th>
-                  <th>Drive Time (s)</th>
-                  <th>Boat Speed (m/s)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {strokes.map((row) => (
-                  <tr key={row.n} className={row.n === strokes.length ? "current" : undefined}>
-                    <td>{row.n}</td>
-                    <td>{formatNumber(row.peak)}</td>
-                    <td>{formatNumber(row.avg)}</td>
-                    <td>{formatNumber(row.impulse)}</td>
-                    <td>{row.drive.toFixed(2)}</td>
-                    <td>{row.speed.toFixed(1)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-        <section className="card technique">
-          <div className="card-head">
-            <h2>Force & Technique Breakdown</h2>
-          </div>
-          <div className="donuts">
-            <div>
-              <p className="donut-title">Drive vs. Recovery</p>
-              <Donut value={athlete.driveShare} color="#2f6bff" center="Drive" />
-            </div>
-            <div>
-              <p className="donut-title">Force Contribution</p>
-              <Donut value={athlete.footboardShare} color="#22a06b" center="Footboard" />
-            </div>
-          </div>
-          <dl className="tech-stats">
-            <div>
-              <dt>Drive Time</dt>
-              <dd>{athlete.driveTime.toFixed(2)} s</dd>
-            </div>
-            <div>
-              <dt>Recovery Time</dt>
-              <dd>{athlete.recoveryTime.toFixed(2)} s</dd>
-            </div>
-            <div>
-              <dt>Footboard Force</dt>
-              <dd>{formatNumber(athlete.footboardForce)} N</dd>
-            </div>
-            <div>
-              <dt>Oarlock Force</dt>
-              <dd>{formatNumber(athlete.oarlockForce)} N</dd>
-            </div>
-          </dl>
-          <div className="note">
-            <strong>Footboard Contribution</strong>
-            Footboard force accounts for {athlete.footboardShare}% of total force at peak drive. Crew average: 32%.
-          </div>
-          <div className="rhythm">
-            <strong>Good rhythm and consistent force.</strong>
-            Keep an eye on early-drive force and footboard contribution as we head into the second 20'.
-          </div>
-          <span className="watermark">Impulse</span>
-        </section>
-        <section className="card trends">
-          <div className="card-head">
-            <h2>Crew Trends (Seat {athlete.seat})</h2>
-            <div className="trend-tools">
-              <Tabs
-                value={trendMode}
-                onChange={onTrend}
-                options={[
-                  { id: "force", label: "Force" },
-                  { id: "impulse", label: "Impulse" },
-                  { id: "speed", label: "Boat Speed" },
-                ]}
-              />
-              <span className="card-sub">Last 10 Strokes</span>
-            </div>
-          </div>
-          <TrendChart mode={trendMode} athlete={athlete} />
-          <Legend
-            items={
-              trendMode === "speed"
-                ? [
-                    { label: "Boat Speed", swatch: "line", color: "#2f6bff" },
-                    { label: "Crew Average", swatch: "dashed" },
-                  ]
-                : [
-                    { label: "Peak Force", swatch: "line", color: "#2f6bff" },
-                    { label: "Avg Force", swatch: "line", color: "#22a06b" },
-                    { label: "Impulse (N·s)", swatch: "line", color: "#f59e0b" },
-                  ]
-            }
-          />
+        <section className="card live-card insights">
+          <h2>
+            <Bulb /> Insights
+          </h2>
+          <p className="card-sub">{single ? `At ${clock(startPoint[0])}, power is ${formatNumber(startPoint[1])} W.` : `From ${clock(startPoint[0])} to ${clock(endPoint[0])}, power averages ${formatNumber(average)} W.`}</p>
+          <ul>
+            {insights.map((insight) => (
+              <li key={insight.text} className={insight.tone}>
+                <InsightMark tone={insight.tone} />
+                <p>{insight.text}</p>
+              </li>
+            ))}
+          </ul>
         </section>
       </div>
     </div>
   );
 }
 
-function Metrics({ athlete }: { athlete: Athlete }) {
+function SeatChat() {
+  const [messages, setMessages] = useState<Array<{ role: "assistant" | "user"; text: string }>>([
+    { role: "assistant", text: "Ask about this session, a seat, or the boat." },
+  ]);
+  const [draft, setDraft] = useState("");
+
+  function send(event: FormEvent) {
+    event.preventDefault();
+    const text = draft.trim();
+    if (!text) {
+      return;
+    }
+    setMessages((current) => [
+      ...current,
+      { role: "user", text },
+      { role: "assistant", text: "The coach chat will answer from this session once it is connected." },
+    ]);
+    setDraft("");
+  }
+
+  return (
+    <section className="seat-chat">
+      <h2>Chat</h2>
+      <div className="chat-log">
+        {messages.map((message, index) => (
+          <p key={`${message.role}-${index}`} className={message.role === "user" ? "chat-bubble mine" : "chat-bubble"}>
+            {message.text}
+          </p>
+        ))}
+      </div>
+      <form onSubmit={send}>
+        <input
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          placeholder="Message"
+          aria-label="Message"
+        />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  );
+}
+
+function Metrics({ athlete, title }: { athlete: Athlete; title?: string }) {
   const rows: Array<{ label: string; value: string; delta?: number; note?: string }> = [
     { label: "Peak Force", value: `${formatNumber(athlete.peakForce)} N`, delta: athlete.deltas.peakForce },
     { label: "Average Force", value: `${formatNumber(athlete.averageForce)} N`, delta: athlete.deltas.averageForce },
@@ -614,7 +1215,7 @@ function Metrics({ athlete }: { athlete: Athlete }) {
   return (
     <aside className="rail">
       <section className="card metrics">
-        <h2>Key Metrics (Seat {athlete.seat})</h2>
+        <h2>{title ?? `Key Metrics (Seat ${athlete.seat})`}</h2>
         <ul>
           {rows.map((row) => (
             <li key={row.label}>
@@ -649,89 +1250,130 @@ function Metrics({ athlete }: { athlete: Athlete }) {
   );
 }
 
-function AthletesPage({
-  roster,
-  selectedId,
-  onSelect,
-}: {
-  roster: Athlete[];
-  selectedId: string;
-  onSelect: (id: string) => void;
-}) {
-  const selected = roster.find((item) => item.id === selectedId) ?? roster[0];
+function displayName(member: TeamAthlete) {
+  return member.username || member.email;
+}
+
+function TeamPage() {
+  const [members, setMembers] = useState<TeamAthlete[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/team/athletes")
+      .then(async (response) => {
+        const body = (await response.json()) as { athletes?: TeamAthlete[]; error?: string };
+        if (!response.ok) {
+          throw new Error(body.error ?? "Could not load the team.");
+        }
+        return body.athletes ?? [];
+      })
+      .then((athletes) => {
+        if (active) {
+          setMembers(athletes);
+        }
+      })
+      .catch((caught) => {
+        if (active) {
+          setError(caught instanceof Error ? caught.message : "Could not load the team.");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (members.length > 0 && !members.some((member) => member.id === selectedId)) {
+      setSelectedId(members[0].id);
+    }
+  }, [members, selectedId]);
+
+  const index = members.findIndex((member) => member.id === selectedId);
+  const member = index >= 0 ? members[index] : undefined;
+  const stats = member ? { ...ATHLETES[index % ATHLETES.length], id: member.id, name: displayName(member) } : undefined;
+
   return (
-    <div className="page">
-      <header className="page-head">
-        <h1>Athletes</h1>
-        <p>{roster.length} rowers in this lineup. Select a seat to compare force, impulse, and drive time.</p>
-      </header>
-      <div className="athlete-grid">
-        {roster.map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            className={item.id === selected.id ? "person selected" : "person"}
-            onClick={() => onSelect(item.id)}
-          >
-            <span className="person-bar" style={{ background: item.color }} />
-            <span className="person-seat">Seat {item.seat}</span>
-            <strong>{item.name}</strong>
-            <span>{item.detail ?? `${item.speedKmh.toFixed(1)} km/h`}</span>
-            <dl>
-              <div>
-                <dt>Peak</dt>
-                <dd>{formatNumber(item.peakForce)} N</dd>
+    <div className="body">
+      <aside className="sidebar">
+        <label className="field">
+          <span>Athlete</span>
+          <select value={selectedId} onChange={(event) => setSelectedId(event.target.value)} disabled={members.length === 0}>
+            {members.length === 0 ? (
+              <option value="">No athletes yet</option>
+            ) : (
+              members.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {displayName(item)}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        <div className="team-roster">
+          {members.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={item.id === selectedId ? "team-member selected" : "team-member"}
+              aria-pressed={item.id === selectedId}
+              onClick={() => setSelectedId(item.id)}
+            >
+              <strong>{displayName(item)}</strong>
+              <small>{item.email}</small>
+            </button>
+          ))}
+        </div>
+      </aside>
+      <main className="stage">
+        <div className="page">
+          <header className="page-head">
+            <h1>Team</h1>
+            <p>
+              {members.length === 0
+                ? "No athletes have joined this team yet."
+                : `${members.length} ${members.length === 1 ? "athlete has" : "athletes have"} joined.`}
+            </p>
+          </header>
+          {error && (
+            <p className="auth-error" role="alert">
+              {error}
+            </p>
+          )}
+          {stats && (
+            <>
+              <div className="summary">
+                <Stat label="Peak force" value={`${formatNumber(stats.peakForce)} N`} />
+                <Stat label="Impulse" value={`${formatNumber(stats.impulse)} N·s`} />
+                <Stat label="Drive time" value={`${stats.driveTime.toFixed(2)} s`} />
+                <Stat label="Boat speed" value={`${stats.boatSpeed.toFixed(1)} m/s`} />
               </div>
-              <div>
-                <dt>Impulse</dt>
-                <dd>{formatNumber(item.impulse)} N·s</dd>
-              </div>
-              <div>
-                <dt>Drive</dt>
-                <dd>{item.driveTime.toFixed(2)} s</dd>
-              </div>
-            </dl>
-          </button>
-        ))}
-      </div>
+              <section className="card">
+                <div className="card-head">
+                  <h2>{stats.name}</h2>
+                </div>
+                <PeakBarChart athletes={[stats]} />
+              </section>
+            </>
+          )}
+        </div>
+      </main>
+      {stats && <Metrics athlete={stats} title={`${stats.name}`} />}
     </div>
   );
 }
 
-function SessionsPage({ workout, onOpen }: { workout: string; onOpen: (name: string) => void }) {
+function AnalyticsPage({ roster, athlete }: { roster: Athlete[]; athlete?: Athlete }) {
+  const lineup = athlete ? [athlete] : roster;
+  const peak = crewPeak(lineup);
+  const impulse = Math.round(lineup.reduce((sum, item) => sum + item.impulse, 0) / lineup.length);
+  const drive = lineup.reduce((sum, item) => sum + item.driveTime, 0) / lineup.length;
   return (
     <div className="page">
       <header className="page-head">
-        <h1>Sessions</h1>
-        <p>Current workout is {workout}. Open a session to view it on the live board.</p>
-      </header>
-      <div className="session-list">
-        {PAST_SESSIONS.map((session) => (
-          <button key={session.id} type="button" className="session-row" onClick={() => onOpen(session.name)}>
-            <span>
-              <strong>{session.name}</strong>
-              <small>{session.when}</small>
-            </span>
-            <span>{session.meta}</span>
-            <span>{session.distance}</span>
-            <span>{session.rate}</span>
-            <em className={session.status === "In progress" ? "status live" : "status"}>{session.status}</em>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function AnalyticsPage({ roster }: { roster: Athlete[] }) {
-  const peak = crewPeak(roster);
-  const impulse = Math.round(roster.reduce((sum, item) => sum + item.impulse, 0) / roster.length);
-  const drive = roster.reduce((sum, item) => sum + item.driveTime, 0) / roster.length;
-  return (
-    <div className="page">
-      <header className="page-head">
-        <h1>Team Analytics</h1>
-        <p>Crew averages for {SESSION.team} across the current lineup.</p>
+        <h1>Analytics</h1>
+        <p>{athlete ? `Your analytics, ${athlete.name}.` : `Crew averages for ${SESSION.team} across the current lineup.`}</p>
       </header>
       <div className="summary">
         <Stat label="Avg peak force" value={`${formatNumber(peak)} N`} />
@@ -741,16 +1383,16 @@ function AnalyticsPage({ roster }: { roster: Athlete[] }) {
       </div>
       <section className="card">
         <div className="card-head">
-          <h2>Peak force by seat</h2>
+          <h2>{athlete ? athlete.name : "Peak force by seat"}</h2>
         </div>
-        <PeakBarChart athletes={roster} />
+        <PeakBarChart athletes={lineup} />
       </section>
       <section className="card table-card">
         <div className="table-wrap">
           <table className="strokes">
             <thead>
               <tr>
-                <th>Seat</th>
+                {!athlete && <th>Seat</th>}
                 <th>Athlete</th>
                 <th>Peak Force (N)</th>
                 <th>Avg Force (N)</th>
@@ -760,9 +1402,9 @@ function AnalyticsPage({ roster }: { roster: Athlete[] }) {
               </tr>
             </thead>
             <tbody>
-              {roster.map((item) => (
+              {lineup.map((item) => (
                 <tr key={item.id}>
-                  <td>{item.seat}</td>
+                  {!athlete && <td>{item.seat}</td>}
                   <td className="name-cell">
                     <i style={{ background: item.color }} />
                     {item.name}
@@ -835,40 +1477,6 @@ function InfoTip({ text }: { text: string }) {
   );
 }
 
-function Chevron() {
-  return (
-    <svg viewBox="0 0 12 8" aria-hidden="true" className="chevron">
-      <path d="M1 1.5 6 6.5 11 1.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function PennMark() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="crest">
-      <path d="M12 2.2 20 5.4v6.2c0 4.5-3.1 8-8 10.2-4.9-2.2-8-5.7-8-10.2V5.4L12 2.2Z" fill="#011F5B" />
-      <path d="M12 7.2 7.8 9v2.8c0 2.2 1.6 4 4.2 5.1 2.6-1.1 4.2-2.9 4.2-5.1V9L12 7.2Z" fill="#fff" />
-      <path d="M12 9.2 9.4 10.4v1.8c0 1.3 1 2.3 2.6 3 1.6-.7 2.6-1.7 2.6-3v-1.8L12 9.2Z" fill="#011F5B" />
-    </svg>
-  );
-}
-
-function PauseIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M5 3.5h2v9H5v-9Zm4 0h2v9H9v-9Z" fill="currentColor" />
-    </svg>
-  );
-}
-
-function PlayIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M6 4.2v7.6L12.2 8 6 4.2Z" fill="currentColor" />
-    </svg>
-  );
-}
-
 function Bulb() {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" className="bulb">
@@ -895,5 +1503,364 @@ function InsightMark({ tone }: { tone: InsightTone }) {
         </>
       )}
     </svg>
+  );
+}
+
+type ProfileRecord = {
+  email: string;
+  username: string | null;
+  role: "athlete" | "coach" | null;
+  provider: string;
+  hasPassword: boolean;
+  memberSince: string | null;
+  team: { name: string | null; location: string | null } | null;
+  stats: {
+    sessions: number;
+    meters: number;
+    durationS: number;
+    strokes: number;
+    avgPowerW: number;
+    maxPowerW: number;
+  };
+};
+
+function formatDuration(seconds: number) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  if (hours === 0) {
+    return `${minutes} min`;
+  }
+  return `${hours}h ${minutes}m`;
+}
+
+function formatDistance(meters: number, unit: "meters" | "kilometers") {
+  if (unit === "kilometers") {
+    return `${(meters / 1000).toFixed(meters >= 10000 ? 1 : 2)} km`;
+  }
+  return `${formatNumber(meters)} m`;
+}
+
+function ProfilePage({ onAccount }: { onAccount: (account: Account) => void }) {
+  const [profile, setProfile] = useState<ProfileRecord | null>(null);
+  const [unit, setUnit] = useState<"meters" | "kilometers">("meters");
+  const [username, setUsername] = useState("");
+  const [usernameNote, setUsernameNote] = useState("");
+  const [usernameError, setUsernameError] = useState("");
+  const [savingName, setSavingName] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordNote, setPasswordNote] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+  const [savingPassword, setSavingPassword] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      fetch("/api/profile").then(async (response) => (response.ok ? ((await response.json()) as ProfileRecord) : null)),
+      fetch("/api/settings").then(async (response) =>
+        response.ok ? ((await response.json()) as { distanceUnit?: "meters" | "kilometers" }) : null,
+      ),
+    ])
+      .then(([body, settings]) => {
+        if (!active || !body) {
+          return;
+        }
+        setProfile(body);
+        setUsername(body.username ?? "");
+        if (settings?.distanceUnit === "kilometers") {
+          setUnit("kilometers");
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setProfile(null);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function saveUsername(event: FormEvent) {
+    event.preventDefault();
+    setUsernameError("");
+    setUsernameNote("");
+    setSavingName(true);
+    try {
+      const response = await fetch("/api/profile", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username }),
+      });
+      const body = (await response.json()) as Account & { error?: string };
+      if (!response.ok) {
+        setUsernameError(body.error ?? "Could not save that username.");
+        return;
+      }
+      onAccount(body);
+      setUsername(body.username ?? "");
+      setProfile((current) => (current ? { ...current, username: body.username } : current));
+      setUsernameNote("Username saved.");
+    } catch {
+      setUsernameError("Could not save that username.");
+    } finally {
+      setSavingName(false);
+    }
+  }
+
+  async function savePassword(event: FormEvent) {
+    event.preventDefault();
+    setPasswordError("");
+    setPasswordNote("");
+    if (nextPassword !== confirmPassword) {
+      setPasswordError("Those passwords do not match.");
+      return;
+    }
+    setSavingPassword(true);
+    try {
+      const response = await fetch("/api/profile/password", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current: currentPassword, next: nextPassword }),
+      });
+      const body = (await response.json()) as { error?: string };
+      if (!response.ok) {
+        setPasswordError(body.error ?? "Could not change that password.");
+        return;
+      }
+      setCurrentPassword("");
+      setNextPassword("");
+      setConfirmPassword("");
+      setPasswordNote("Password updated.");
+    } catch {
+      setPasswordError("Could not change that password.");
+    } finally {
+      setSavingPassword(false);
+    }
+  }
+
+  const stats = profile?.stats;
+  const memberSince = profile?.memberSince
+    ? new Date(profile.memberSince).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })
+    : "";
+
+  return (
+    <main className="account-page">
+      <h1>Profile</h1>
+      <p className="account-lead">
+        {profile?.role === "coach" ? "Coach" : "Athlete"}
+        {profile?.team?.name ? ` · ${profile.team.name}` : ""}
+        {memberSince ? ` · Member since ${memberSince}` : ""}
+      </p>
+      <div className="stat-grid">
+        <article className="stat-tile">
+          <span>Sessions</span>
+          <strong>{formatNumber(stats?.sessions ?? 0)}</strong>
+        </article>
+        <article className="stat-tile">
+          <span>Meters rowed</span>
+          <strong>{formatDistance(stats?.meters ?? 0, unit)}</strong>
+        </article>
+        <article className="stat-tile">
+          <span>Time on the water</span>
+          <strong>{formatDuration(stats?.durationS ?? 0)}</strong>
+        </article>
+        <article className="stat-tile">
+          <span>Strokes</span>
+          <strong>{formatNumber(stats?.strokes ?? 0)}</strong>
+        </article>
+        <article className="stat-tile">
+          <span>Average power</span>
+          <strong>{stats?.avgPowerW ? `${formatNumber(stats.avgPowerW)} W` : "—"}</strong>
+        </article>
+        <article className="stat-tile">
+          <span>Best power</span>
+          <strong>{stats?.maxPowerW ? `${formatNumber(stats.maxPowerW)} W` : "—"}</strong>
+        </article>
+      </div>
+      <div className="account-grid">
+        <form className="account-card" onSubmit={(event) => void saveUsername(event)}>
+          <h2>Account</h2>
+          <label className="auth-field">
+            <span>Email</span>
+            <input value={profile?.email ?? ""} readOnly />
+          </label>
+          <label className="auth-field">
+            <span>Username</span>
+            <input
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              autoComplete="username"
+              minLength={3}
+              maxLength={24}
+              required
+            />
+          </label>
+          {usernameError && (
+            <p className="auth-error" role="alert">
+              {usernameError}
+            </p>
+          )}
+          {usernameNote && <p className="account-note">{usernameNote}</p>}
+          <button className={savingName ? "auth-submit busy" : "auth-submit"} type="submit" disabled={savingName}>
+            {savingName ? "Saving" : "Save username"}
+          </button>
+        </form>
+        {profile?.hasPassword ? (
+          <form className="account-card" onSubmit={(event) => void savePassword(event)}>
+            <h2>Password</h2>
+            <label className="auth-field">
+              <span>Current password</span>
+              <input
+                type="password"
+                value={currentPassword}
+                onChange={(event) => setCurrentPassword(event.target.value)}
+                autoComplete="current-password"
+                required
+              />
+            </label>
+            <label className="auth-field">
+              <span>New password</span>
+              <input
+                type="password"
+                value={nextPassword}
+                onChange={(event) => setNextPassword(event.target.value)}
+                autoComplete="new-password"
+                required
+              />
+            </label>
+            <label className="auth-field">
+              <span>Confirm new password</span>
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+                required
+              />
+            </label>
+            <p className="account-hint">At least 8 characters, with an uppercase letter and a number.</p>
+            {passwordError && (
+              <p className="auth-error" role="alert">
+                {passwordError}
+              </p>
+            )}
+            {passwordNote && <p className="account-note">{passwordNote}</p>}
+            <button className={savingPassword ? "auth-submit busy" : "auth-submit"} type="submit" disabled={savingPassword}>
+              {savingPassword ? "Saving" : "Update password"}
+            </button>
+          </form>
+        ) : (
+          <section className="account-card">
+            <h2>Password</h2>
+            <p className="account-hint">This account signs in with {profile?.provider === "google" ? "Google" : "an outside provider"}.</p>
+          </section>
+        )}
+      </div>
+    </main>
+  );
+}
+
+type SettingsRecord = {
+  distanceUnit: "meters" | "kilometers";
+  sessionEmail: boolean;
+  weeklySummary: boolean;
+};
+
+function SettingsPage() {
+  const [settings, setSettings] = useState<SettingsRecord | null>(null);
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/settings")
+      .then(async (response) => (response.ok ? ((await response.json()) as SettingsRecord) : null))
+      .then((body) => {
+        if (active && body) {
+          setSettings(body);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setError("Could not load settings.");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function save(next: SettingsRecord) {
+    setSettings(next);
+    setError("");
+    setNote("");
+    const response = await fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(next),
+    });
+    if (!response.ok) {
+      setError("Could not save those settings.");
+      return;
+    }
+    setNote("Saved.");
+  }
+
+  return (
+    <main className="account-page">
+      <h1>Settings</h1>
+      <p className="account-lead">These apply to this account.</p>
+      {error && (
+        <p className="auth-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="account-grid">
+        <section className="account-card">
+          <h2>Units</h2>
+          <p className="account-hint">Distance on your profile uses this unit.</p>
+          <label className="setting-choice">
+            <input
+              type="radio"
+              name="distance-unit"
+              checked={settings?.distanceUnit !== "kilometers"}
+              onChange={() => settings && void save({ ...settings, distanceUnit: "meters" })}
+            />
+            <span>Meters</span>
+          </label>
+          <label className="setting-choice">
+            <input
+              type="radio"
+              name="distance-unit"
+              checked={settings?.distanceUnit === "kilometers"}
+              onChange={() => settings && void save({ ...settings, distanceUnit: "kilometers" })}
+            />
+            <span>Kilometers</span>
+          </label>
+        </section>
+        <section className="account-card">
+          <h2>Email</h2>
+          <label className="setting-choice">
+            <input
+              type="checkbox"
+              checked={settings?.sessionEmail ?? true}
+              onChange={(event) => settings && void save({ ...settings, sessionEmail: event.target.checked })}
+            />
+            <span>Email me when a session is saved</span>
+          </label>
+          <label className="setting-choice">
+            <input
+              type="checkbox"
+              checked={settings?.weeklySummary ?? false}
+              onChange={(event) => settings && void save({ ...settings, weeklySummary: event.target.checked })}
+            />
+            <span>Send a weekly training summary</span>
+          </label>
+          {note && <p className="account-note">{note}</p>}
+        </section>
+      </div>
+    </main>
   );
 }
