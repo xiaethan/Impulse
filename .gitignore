@@ -2,3 +2,11 @@
 __pycache__/
 *.pyc
 /image_db/
+
+# PlatformIO
+sensors/oarlock/.vscode/.browse.c_cpp.db*
+sensors/oarlock/.vscode/c_cpp_properties.json
+sensors/oarlock/.vscode/launch.json
+sensors/oarlock/.vscode/ipch
+sensors/oarlock/.pio/
+sensors/oarlock/compile_commands.json
