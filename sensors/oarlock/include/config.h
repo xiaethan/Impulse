@@ -1,26 +1,27 @@
 #ifndef OARLOCK_CONFIG_H
 #define OARLOCK_CONFIG_H
 
-#include "ads1220.h"
-
 #define SENSOR_NAME "oarlock"
 
-/* ESP32 VSPI pins from the oarlock schematic.
-   DRDY is not wired, so the read loop paces itself. */
-#define PIN_SCK 18
-#define PIN_MISO 19
-#define PIN_MOSI 23
-#define PIN_CS 5
-#define PIN_DRDY ADS1220_PIN_UNUSED
+#define PIN_DRDY 5
+#define PIN_MOSI 6
+#define PIN_MISO 7
+#define PIN_SCK 10
+#define PIN_CS 4
 
-/* 20 SPS. The loop waits this long between reads when DRDY is open. */
-#define SAMPLE_PERIOD_MS 50
+/* ADS1220 image that reads this bridge:
+   0x0E AIN0-AIN1, gain 128
+   0x04 continuous conversion, 20 SPS
+   0x00 internal 2.048 V reference
+   0x00 defaults */
+#define BRIDGE_WREG 0x43
+#define BRIDGE_REG0 0x0E
+#define BRIDGE_REG1 0x04
+#define BRIDGE_REG2 0x00
+#define BRIDGE_REG3 0x00
 
-/* Quarter-bridge output, after the RC filter, on AIN0 and AIN1.
-   Gain 128 is +/-16 mV full scale against the 2.048 V reference. */
-#define BRIDGE_MUX ADS1220_MUX_AIN0_AIN1
-#define BRIDGE_GAIN ADS1220_GAIN_128
-#define BRIDGE_RATE ADS1220_DR_20SPS
-#define BRIDGE_REJECT ADS1220_REJECT_50_60
+#define CMD_RESET 0x06
+#define CMD_START 0x08
+#define CMD_RDATA 0x10
 
 #endif

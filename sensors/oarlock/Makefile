@@ -1,4 +1,4 @@
-FQBN ?= esp32:esp32:esp32
+FQBN ?= esp32:esp32:esp32c3:CDCOnBoot=cdc
 PORT ?= COM3
 BAUD ?= 115200
 LIB  := ../common

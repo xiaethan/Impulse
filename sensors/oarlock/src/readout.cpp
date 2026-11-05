@@ -1,75 +1,90 @@
 #include <Arduino.h>
+#include <SPI.h>
 
-#include "../include/config.h"
+//#include "../include/config.h"
 
-static ads1220_config bridge;
 
-static void print_regs(void)
+// M5Stamp ESP32-C3 connections
+#define PIN_DRDY 5
+#define PIN_MOSI 6
+#define PIN_MISO 7
+#define PIN_SCK 10
+#define PIN_CS 4
+
+#define CMD_RESET  0x06
+#define CMD_START  0x08
+#define CMD_RDATA  0x10
+#define CMD_WREG   0x40
+
+#define BRIDGE_WREG 0x43
+#define BRIDGE_REG0 0x0E
+#define BRIDGE_REG1 0x04
+#define BRIDGE_REG2 0x00
+#define BRIDGE_REG3 0x00
+
+static const SPISettings ads_spi(1000000, MSBFIRST, SPI_MODE1);
+
+static void ads_command(uint8_t command)
 {
-    uint8_t regs[4];
-    uint8_t i;
+    SPI.beginTransaction(ads_spi);
+    digitalWrite(PIN_CS, LOW);
+    SPI.transfer(command);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.endTransaction();
+}
 
-    ads1220_read_regs(0, regs, 4);
-    Serial.print(SENSOR_NAME);
-    Serial.print(" regs:");
-    for (i = 0; i < 4; i++) {
-        Serial.print(' ');
-        if (regs[i] < 0x10) {
-            Serial.print('0');
-        }
-        Serial.print(regs[i], HEX);
+static void ads_configure(void)
+{
+    uint8_t buf[5] = { BRIDGE_WREG, BRIDGE_REG0, BRIDGE_REG1, BRIDGE_REG2, BRIDGE_REG3 };
+
+    SPI.beginTransaction(ads_spi);
+    digitalWrite(PIN_CS, LOW);
+    SPI.transfer(buf, 5);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.endTransaction();
+}
+
+static int32_t ads_read(void)
+{
+    uint8_t buf[4] = { CMD_RDATA, 0x00, 0x00, 0x00 };
+    uint32_t value;
+
+    SPI.beginTransaction(ads_spi);
+    digitalWrite(PIN_CS, LOW);
+    SPI.transfer(buf, 4);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.endTransaction();
+
+    value = ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | buf[3];
+    if (value & 0x00800000u) {
+        value |= 0xff000000u;
     }
-    Serial.println();
+    return (int32_t)value;
 }
 
 void setup(void)
 {
-    unsigned long start = millis();
-
     Serial.begin(115200);
-    while (!Serial && (millis() - start) < 3000) {
-    }
+    delay(1500);
 
-    bridge.pin_cs = PIN_CS;
-    bridge.pin_drdy = PIN_DRDY;
-    bridge.pin_sck = PIN_SCK;
-    bridge.pin_miso = PIN_MISO;
-    bridge.pin_mosi = PIN_MOSI;
-    bridge.mux = BRIDGE_MUX;
-    bridge.gain = BRIDGE_GAIN;
-    bridge.data_rate = BRIDGE_RATE;
-    bridge.vref = ADS1220_VREF_INTERNAL;
-    bridge.reject = BRIDGE_REJECT;
+    pinMode(PIN_CS, OUTPUT);
+    pinMode(PIN_DRDY, INPUT_PULLUP);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+
+    ads_command(CMD_RESET);
+    delay(10);
+    ads_configure();
+    ads_command(CMD_START);
 
     Serial.println(SENSOR_NAME);
-    if (ads1220_init(&bridge) != 0) {
-        while (1) {
-            Serial.println("ADS1220 config readback failed");
-            print_regs();
-            delay(1000);
-        }
-    }
-    print_regs();
-    Serial.println("raw,uV");
+    Serial.println("raw");
 }
 
 void loop(void)
 {
-    int32_t raw;
-    int32_t microvolts;
-
-#if PIN_DRDY == ADS1220_PIN_UNUSED
-    delay(SAMPLE_PERIOD_MS);
-#else
-    if (ads1220_wait_drdy(500) != 0) {
-        Serial.println("timeout waiting for DRDY");
+    if (digitalRead(PIN_DRDY) != LOW) {
         return;
     }
-#endif
-
-    raw = ads1220_read_raw();
-    microvolts = ads1220_microvolts(raw, bridge.gain, ADS1220_VREF_INTERNAL_UV);
-    Serial.print(raw);
-    Serial.print(',');
-    Serial.println(microvolts);
+    Serial.println(ads_read());
 }
