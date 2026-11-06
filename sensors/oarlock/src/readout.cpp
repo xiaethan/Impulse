@@ -6,6 +6,14 @@
 
 #define SENSOR_NAME "Oarlock Test"
 
+int32_t tare_offset = 0;
+float filtered_force = 0.0;
+const float alpha = 0.15;    // Smoothing factor (0.05 = heavier filtering, 0.3 = faster response)
+const int32_t positive_DEADBAND = 3000; // Ignore noise below this magnitude
+const int32_t negative_DEADBAND = -3000; // Ignore noise above this magnitude
+int32_t output_force = 0;
+
+
 static const SPISettings ads_spi(1000000, MSBFIRST, SPI_MODE1);
 
 /* The QT Py profile sends Serial to the native USB port. This cable is the
@@ -83,7 +91,27 @@ static int32_t ads_read(void)
         value |= 0xff000000u;
     }
 
+
     return (int32_t)value;
+}
+
+void tare_sensor(void)
+{
+    Serial.println("Zeroing sensor... Do not touch film.");
+    delay(2000); 
+
+    int64_t sum = 0;
+    const int num_samples = 60;
+
+    for (int i = 0; i < num_samples; i++) {
+        while (digitalRead(PIN_DRDY) != LOW); // Wait for new ADC sample
+        sum += ads_read();
+        delay(5);
+    }
+
+    // Lock in the baseline
+    tare_offset = (int32_t)(sum / num_samples);
+
 }
 
 void setup(void)
@@ -106,6 +134,8 @@ void setup(void)
 
     log_println(SENSOR_NAME);
     log_println("raw");
+
+    tare_sensor();
 }
 
 void loop(void)
@@ -113,6 +143,26 @@ void loop(void)
     if (digitalRead(PIN_DRDY) != LOW) {
         return;
     }
+    int32_t sample = ads_read();
+    int32_t raw_force_reading = sample - tare_offset;
 
-    log_println(ads_read());
+    filtered_force = alpha * raw_force_reading + (1 - alpha) * filtered_force;
+
+    log_println("Filtered force:");
+    log_println(filtered_force);
+
+
+    if ((filtered_force < positive_DEADBAND) && (filtered_force > negative_DEADBAND)) {
+        output_force = 0;
+    } else {
+        output_force = (int32_t) filtered_force;
+    }
+
+    log_println("Raw:");
+    log_println(raw_force_reading);
+
+    log_println("\t Output Force: ");
+    log_println(output_force);
+
 }
+
